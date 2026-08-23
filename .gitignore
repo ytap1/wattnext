@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets — never commit
+.env
+*.key
+.streamlit/secrets.toml
+
+# IDE / OS junk
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
