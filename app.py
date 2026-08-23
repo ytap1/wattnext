@@ -53,11 +53,25 @@ STEP_DELAY_SEC = 0.5
 # ============================================================
 # 1) SECRETS + CLIENT (once per session)
 # ============================================================
-_api_key = agent._load_api_key()
+def _resolve_api_key() -> "str | None":
+    """Prefer st.secrets (works on Streamlit Community Cloud AND from a local
+    .streamlit/secrets.toml); fall back to env/file for headless runs (tests)."""
+    key = None
+    try:
+        key = st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        key = None
+    if not key:
+        key = agent._load_api_key()
+    return key if key and key != "PASTE_YOUR_GEMINI_API_KEY_HERE" else None
+
+
+_api_key = _resolve_api_key()
 if not _api_key:
     st.error(
-        "Missing **GEMINI_API_KEY**. Paste your Google AI Studio key into "
-        "`.streamlit/secrets.toml` (replace `PASTE_YOUR_GEMINI_API_KEY_HERE`), then rerun."
+        "Missing **GEMINI_API_KEY**. Locally: add it to `.streamlit/secrets.toml`. "
+        "On Streamlit Cloud: add it under **App settings → Secrets** in TOML form "
+        "(`GEMINI_API_KEY = \"...\"`), then rerun."
     )
     st.stop()
 
