@@ -1,0 +1,31 @@
+name: tests
+
+# Runs the WattNext regression suite on every PR into main (and on pushes to main).
+# A red run blocks the merge once this check is marked "required" in branch protection.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run WattNext tests (flow, debug views, live Gemini call)
+        env:
+          # Add this in repo Settings -> Secrets and variables -> Actions.
+          # Note: fork PRs don't receive secrets, so the live test only runs on
+          # same-repo (collaborator) branches.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python test_app.py
