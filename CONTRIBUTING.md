@@ -39,9 +39,34 @@ Must print **`3/3 passed`**. This checks the accept/decline flow, the debug pane
 the **live Gemini call still works** — catching a broken flow or a dead key *before* it reaches
 the live demo. Do not push on a red test.
 
+## Current work: the v2 rebuild (integration branch)
+
+We're expanding 3 → 5 resolution routes (see `DEV_HANDOVER_v2.md`). To keep `main`'s live demo
+stable during the multi-day rebuild, **all v2 work goes through a shared integration branch, not
+straight into `main`:**
+
+- **`v2-5routes`** — the shared v2 workspace (created off `main` by @ytap1).
+- **`v2-agent`** — Dev A's branch (`agent.py`, `test_agent.py`), branched off `v2-5routes`.
+- **`v2-ui`** — Dev B's branch (`app.py`, `test_app.py`), branched off `v2-5routes`.
+
+Flow while the rebuild is in progress:
+1. `git switch v2-5routes && git pull`, then `git switch -c v2-agent` (or `v2-ui`).
+2. Work, run the tests, commit, `git push -u origin v2-agent`.
+3. Open a PR **into `v2-5routes`** (⚠️ not `main`). Wait for the green CI check; get a review.
+4. @ytap1 merges `v2-5routes` → `main` **only when v2 is demo-ready** — that final merge is the one
+   that reaches the live app, and it follows the `main` release-gate rules in the next section.
+
+> New to Git/GitHub? Read **`ONBOARDING_git.md`** first, then come back here.
+>
+> Tests during v2: run **both** suites before every push — `venv\Scripts\python.exe test_app.py`
+> and `venv\Scripts\python.exe test_agent.py` (Dev A adds the latter; update
+> `.github/workflows/test.yml` to run both).
+
 ## Branch & merge workflow (main = the live demo)
 
 `main` auto-deploys to the pitch app, so it is the release gate. **Do not commit directly to `main`.**
+(During the v2 rebuild, PRs target `v2-5routes` per the section above; these rules govern the final
+`v2-5routes` → `main` merge and any hotfix straight to `main`.)
 
 1. Branch off `main` (prefixes: `feat/`, `fix/`, `docs/`, `chore/`):
    ```bash

@@ -1,0 +1,16 @@
+<svg width="256" height="256" viewBox="0 0 256 256" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>WattNext favicon / app icon</title>
+<desc>Rounded square ink tile with a blue node, a detected spike, and a blue-to-bright-cyan breakout arrow.</desc>
+<defs>
+<linearGradient id="pg" gradientUnits="userSpaceOnUse" x1="50" y1="198" x2="187" y2="53">
+<stop offset="0" stop-color="#2563EB"/>
+<stop offset="0.4" stop-color="#2563EB"/>
+<stop offset="0.7" stop-color="#06B6D4"/>
+<stop offset="1" stop-color="#22D3EE"/>
+</linearGradient>
+</defs>
+<rect x="0" y="0" width="256" height="256" rx="60" fill="#0F172A"/>
+<path d="M50,198 L86,198 L118,72 L150,198 L187,53" fill="none" stroke="url(#pg)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="162,77 187,53 197,85" fill="none" stroke="#22D3EE" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="68" cy="198" r="12" fill="#2563EB"/>
+</svg>
