@@ -26,6 +26,10 @@ APP = str(Path(__file__).parent / "app.py")
 EXPECTED_ROUTE = {"Maria Santos": "ASSISTANCE_ENROLLMENT", "James Carter": "BUDGET_BILLING"}
 
 
+class SkipTest(Exception):
+    """Raised to skip a test that can't run in this environment (e.g. no API key in CI)."""
+
+
 # ---- helpers ---------------------------------------------------------------
 def _click(at, needle):
     for b in at.button:
@@ -48,8 +52,15 @@ def _md(at):
 
 
 def _fresh_run_for_maria():
-    """Start the app, select Maria, run the agent. Returns the AppTest instance."""
+    """Start the app, select Maria, run the agent. Returns the AppTest instance.
+
+    The app hard-stops without a key, so we inject one into the simulated secrets:
+    the real key locally (so the UI test also exercises the live call), or a dummy
+    in CI (no key present) — where decide() falls back to the deterministic path and
+    the flow still completes. This is the "passes even offline" contract.
+    """
     at = AppTest.from_file(APP, default_timeout=45)
+    at.secrets["GEMINI_API_KEY"] = agent._load_api_key() or "ci-dummy-key"
     at.run()
     assert not at.exception, f"app raised on startup: {at.exception}"
     _click(at, "Maria")
@@ -108,9 +119,11 @@ def test_debug_views():
 
 def test_live_decision():
     """The ONE real Gemini call still works and routes DIVERGE per customer.
-    Requires a working GEMINI_API_KEY — this is the pre-pitch 'is it live?' check."""
+    Requires a working GEMINI_API_KEY — this is the pre-pitch 'is it live?' check.
+    Skipped (not failed) when no key is present, e.g. in CI without the secret."""
     key = agent._load_api_key()
-    assert key, "No GEMINI_API_KEY (env or .streamlit/secrets.toml) — cannot verify the live call."
+    if not key:
+        raise SkipTest("no GEMINI_API_KEY (env or .streamlit/secrets.toml) — live call not verified here")
     client = agent.build_client(key)
     routes = {}
     for cust in agent.CUSTOMERS:
@@ -131,11 +144,15 @@ if __name__ == "__main__":
     import sys
 
     tests = [test_deliver_flow, test_debug_views, test_live_decision]
-    failures = 0
+    passed = failures = skipped = 0
     for t in tests:
         try:
             t()
+            passed += 1
             print(f"PASS  {t.__name__}")
+        except SkipTest as e:
+            skipped += 1
+            print(f"SKIP  {t.__name__}: {e}")
         except AssertionError as e:
             failures += 1
             print(f"FAIL  {t.__name__}: {e}")
@@ -143,5 +160,5 @@ if __name__ == "__main__":
             failures += 1
             print(f"ERROR {t.__name__}: {type(e).__name__}: {e}")
 
-    print(f"\n{len(tests) - failures}/{len(tests)} passed")
+    print(f"\n{passed} passed, {failures} failed, {skipped} skipped (of {len(tests)})")
     sys.exit(1 if failures else 0)
