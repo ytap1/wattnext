@@ -12,6 +12,7 @@ Everything else in WattNext is mocked; this call is the only real AI decision.
 import json
 import os
 import pathlib
+import re
 import tomllib
 
 from google import genai
@@ -73,13 +74,17 @@ def _strip_code_fences(text: str) -> str:
     return t.strip()
 
 
-def _parse_decision(text: str) -> dict | None:
-    """Parse the model's JSON; return None if invalid or route not in ROUTES."""
+def _parse_decision(text: str, valid_routes: set) -> dict | None:
+    """Parse the model's JSON; return None if invalid or route not in valid_routes.
+
+    valid_routes is passed in (not hardcoded) so the same parser serves every
+    domain's route enum — bill-shock ROUTES, first-response CALL_ROUTES, etc.
+    """
     try:
         obj = json.loads(_strip_code_fences(text))
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(obj, dict) or obj.get("route") not in ROUTES:
+    if not isinstance(obj, dict) or obj.get("route") not in valid_routes:
         return None
     obj.setdefault("reasoning_steps", [])
     obj.setdefault("rationale", "")
@@ -120,14 +125,25 @@ def _deterministic_decision(customer: dict) -> dict:
     }
 
 
-def decide(client: genai.Client, customer: dict) -> dict:
+def decide(
+    client: genai.Client,
+    customer: dict,
+    build_prompt_fn=build_prompt,
+    deterministic_fn=_deterministic_decision,
+    valid_routes: set = ROUTES,
+) -> dict:
     """
-    The ONE agentic call. Returns:
+    The ONE agentic call. Domain-agnostic: the domain supplies its prompt builder,
+    deterministic fallback, and valid-route set; the primary->fallback model switch
+    and JSON-parse-with-fallback logic below are identical for every domain.
+
+    Defaults reproduce the original bill-shock behaviour, so decide(client, customer)
+    keeps working unchanged. Returns:
       {route, reasoning_steps, rationale, action_params, model_used, source}
     source is "live" (from Gemini) or "fallback" (deterministic rule-based).
     reasoning_steps is what the live decision-log panel renders line by line.
     """
-    system_instruction, user_content = build_prompt(customer)
+    system_instruction, user_content = build_prompt_fn(customer)
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=0.0,
@@ -148,7 +164,7 @@ def decide(client: genai.Client, customer: dict) -> dict:
             )
         except Exception:
             continue  # try the fallback model
-        parsed = _parse_decision(getattr(response, "text", "") or "")
+        parsed = _parse_decision(getattr(response, "text", "") or "", valid_routes)
         if parsed is not None:
             parsed["model_used"] = model
             parsed["source"] = "live"
@@ -156,10 +172,201 @@ def decide(client: genai.Client, customer: dict) -> dict:
         # Live call succeeded but output was unparseable/invalid — try next model once.
 
     # Both models failed (or produced invalid output): deterministic fallback.
-    decision = _deterministic_decision(customer)
+    decision = deterministic_fn(customer)
     decision["model_used"] = "none"
     decision["source"] = "fallback"
     return decision
+
+
+# ==================================================================
+# SECOND DOMAIN — Gas-leak first-response call triage.
+# Reuses the DETECT -> DECIDE -> DELIVER engine above (same decide(),
+# same _parse_decision) with its own routes, prompt, and fallback.
+# Output is handed to a HUMAN dispatcher — never auto-dispatched.
+# ==================================================================
+
+# First-response routes — a SEPARATE enum; bill-shock ROUTES is untouched.
+CALL_ROUTES = {"DISPATCH_NOW", "SCHEDULE_TECH", "ESCALATE_HUMAN"}
+
+# Fallback keyword signals (matched against the lowercased transcript).
+# Active-danger => a leak is likely live: emergency responder.
+ACTIVE_DANGER_KEYWORDS = frozenset({
+    "hiss", "hissing", "evacuat", "rotten egg", "strong smell", "strong odor",
+    "strong odour", "dizzy", "dizziness", "nausea", "nauseous", "headache",
+    "can't breathe", "cant breathe", "trouble breathing", "short of breath",
+    "passed out", "collaps", "unconscious", "lightheaded", "light-headed",
+    "loud", "confirmed leak", "gas everywhere", "filling with gas", "explos",
+})
+# Odor-only => a complaint with low signal: non-emergency technician visit.
+ODOR_KEYWORDS = frozenset({
+    "smell", "odor", "odour", "faint", "whiff", "gassy", "sulphur", "sulfur",
+})
+
+
+def build_call_prompt(call: dict) -> tuple[str, str]:
+    """Return (system_instruction, user_content) for a first-response DECIDE call.
+
+    Same JSON schema as build_prompt so _parse_decision handles both; only the
+    domain, route set, and the safety bias differ.
+    """
+    system_instruction = (
+        "You are WattNext's first-response triage agent for a utility contact centre. "
+        "You read a raw inbound call transcript about a possible gas odor or leak and "
+        "recommend ONE routing decision for a HUMAN dispatcher. You never dispatch "
+        "anyone yourself. Choose EXACTLY ONE route from this set: "
+        f"{sorted(CALL_ROUTES)}. "
+        "DISPATCH_NOW = the transcript strongly indicates an active/confirmed leak "
+        "(e.g. smell PLUS hissing, evacuation in progress, or physical symptoms like "
+        "dizziness/nausea/trouble breathing). Send an emergency responder. "
+        "SCHEDULE_TECH = a low-signal odor complaint with NO active-danger indicators. "
+        "Book a non-emergency technician visit. "
+        "ESCALATE_HUMAN = signals are ambiguous, conflicting, or a safety-critical "
+        "detail is missing. Route to a human dispatcher to decide. "
+        "SAFETY RULE: this is a life-safety call. When the transcript is ambiguous or a "
+        "safety-critical detail is missing, choose ESCALATE_HUMAN — bias toward human "
+        "review. Never guess DISPATCH_NOW or SCHEDULE_TECH on incomplete information. "
+        "Explain your reasoning step by step as short lines a dispatcher could read aloud. "
+        "Return ONLY a JSON object, no prose, no code fences, matching this schema: "
+        '{"route": "<one of the routes>", '
+        '"reasoning_steps": ["step 1", "step 2", ...], '
+        '"rationale": "one-sentence summary of the decision", '
+        '"action_params": {"dispatch_packet": {'
+        '"severity_tier": "<CRITICAL|HIGH|LOW|NEEDS_REVIEW>", '
+        '"address": "<caller address>", '
+        '"vulnerability_flags": "<vulnerability notes or none>", '
+        '"responder_summary": "<one-line brief for the responder>"}}}'
+    )
+    vuln = call.get("account_vulnerability_flag") or "none on file"
+    user_content = (
+        "Inbound gas-odor/leak call:\n"
+        f"- Caller: {call.get('caller_name')}\n"
+        f"- Address: {call.get('address')}\n"
+        f"- Medical-dependent household (from customer record): {call.get('medical_dependent')}\n"
+        f"- Account vulnerability flag: {vuln}\n"
+        "- Raw call transcript:\n"
+        f"\"\"\"\n{call.get('transcript')}\n\"\"\"\n"
+    )
+    return system_instruction, user_content
+
+
+_NEGATOR_RE = re.compile(r"\b(no|not|n't|without|never)\s*$")
+
+
+def _mentions(transcript: str, keywords) -> bool:
+    """True if the transcript contains any keyword NOT under a nearby negator.
+
+    Substring matching alone misfires on 'No hissing' / 'not dizzy' — so an
+    occurrence immediately preceded (within ~8 chars) by no/not/n't/without/never
+    is treated as negated and skipped. Keeps the fallback honest without a parser.
+    """
+    for kw in keywords:
+        for m in re.finditer(re.escape(kw), transcript):
+            prefix = transcript[max(0, m.start() - 8):m.start()]
+            if _NEGATOR_RE.search(prefix):
+                continue
+            return True
+    return False
+
+
+def _deterministic_call_decision(call: dict) -> dict:
+    """Rule-based fallback for first-response, so the demo always completes.
+
+    Rules (per spec):
+      vulnerable AND active-danger keyword -> DISPATCH_NOW (CRITICAL)
+      active-danger keyword                -> DISPATCH_NOW (HIGH)
+      odor-only language                   -> SCHEDULE_TECH (LOW)
+      otherwise                            -> ESCALATE_HUMAN (NEEDS_REVIEW)
+    """
+    transcript = (call.get("transcript") or "").lower()
+    vuln_flag = call.get("account_vulnerability_flag")
+    vulnerable = bool(call.get("medical_dependent")) or bool(vuln_flag)
+    has_danger = _mentions(transcript, ACTIVE_DANGER_KEYWORDS)
+    has_odor = _mentions(transcript, ODOR_KEYWORDS)
+
+    vuln_flags = vuln_flag if vuln_flag else ("medical-dependent household" if call.get("medical_dependent") else "none")
+
+    if has_danger and vulnerable:
+        route, severity = "DISPATCH_NOW", "CRITICAL"
+        steps = [
+            "Transcript contains active-danger language (leak likely live).",
+            "Household is medical-dependent or flagged vulnerable — highest priority.",
+            "Life-safety risk; do not wait for a technician window.",
+            "Best route: dispatch an emergency responder now.",
+        ]
+        rationale = "Active-danger signal in a vulnerable household — dispatch an emergency responder immediately."
+        summary = "Suspected active gas leak; vulnerable occupant — emergency response."
+    elif has_danger:
+        route, severity = "DISPATCH_NOW", "HIGH"
+        steps = [
+            "Transcript contains active-danger language (leak likely live).",
+            "No vulnerability flag, but the active-danger signal governs.",
+            "Life-safety risk outweighs a scheduled visit.",
+            "Best route: dispatch an emergency responder now.",
+        ]
+        rationale = "Active-danger signal in the transcript — dispatch an emergency responder."
+        summary = "Suspected active gas leak — emergency response."
+    elif has_odor:
+        route, severity = "SCHEDULE_TECH", "LOW"
+        steps = [
+            "Transcript reports an odor but no active-danger indicators.",
+            "No evacuation, hissing, or physical symptoms mentioned.",
+            "Low-signal complaint suited to a non-emergency visit.",
+            "Best route: schedule a technician.",
+        ]
+        rationale = "Low-signal odor complaint with no active-danger indicators — schedule a technician."
+        summary = "Odor complaint, no active-danger indicators — non-emergency technician visit."
+    else:
+        route, severity = "ESCALATE_HUMAN", "NEEDS_REVIEW"
+        steps = [
+            "Transcript signals are ambiguous or a safety-critical detail is missing.",
+            "Cannot safely confirm or rule out an active leak from this text.",
+            "Life-safety call — do not guess.",
+            "Best route: escalate to a human dispatcher to decide.",
+        ]
+        rationale = "Ambiguous or incomplete signals on a life-safety call — escalate to a human dispatcher."
+        summary = "Ambiguous gas-odor call — needs a human dispatcher to decide."
+
+    return {
+        "route": route,
+        "reasoning_steps": steps,
+        "rationale": rationale,
+        "action_params": {
+            "dispatch_packet": {
+                "severity_tier": severity,
+                "address": call.get("address"),
+                "vulnerability_flags": vuln_flags,
+                "responder_summary": summary,
+            },
+        },
+    }
+
+
+# Public alias — the two demo calls, consumed by app.py's First Response DETECT panel.
+# Routes MUST differ: Call A -> DISPATCH_NOW, Call B -> SCHEDULE_TECH.
+CALLS = [
+    {
+        "caller_name": "Rosa Delgado",
+        "address": "418 Maple Street, Apt 2B",
+        "transcript": (
+            "Caller: There's a really strong smell of gas in my kitchen and I can hear "
+            "a hissing sound near the stove. I'm feeling dizzy so I stepped out onto the "
+            "porch. My husband is on oxygen and still inside — please hurry."
+        ),
+        "medical_dependent": True,
+        "account_vulnerability_flag": "elderly, oxygen-dependent",
+    },
+    {
+        "caller_name": "Trevor Nash",
+        "address": "77 Birchwood Lane",
+        "transcript": (
+            "Caller: I think I catch a faint odor near the water heater every now and "
+            "then. It's very slight, nothing right now. No hissing, everyone's fine — I "
+            "just wanted someone to take a look when it's convenient."
+        ),
+        "medical_dependent": False,
+        "account_vulnerability_flag": None,
+    },
+]
 
 
 # ------------------------------------------------------------------
@@ -216,6 +423,7 @@ if __name__ == "__main__":
     api_key = _load_api_key()
     if api_key:
         client = build_client(api_key)
+        print("=== Bill Shock ===")
         for cust in _SMOKE_CUSTOMERS:
             result = decide(client, cust)
             print(
@@ -225,8 +433,28 @@ if __name__ == "__main__":
             for step in result["reasoning_steps"]:
                 print(f"    • {step}")
             print()
+        print("=== First Response ===")
+        for call in CALLS:
+            result = decide(
+                client, call,
+                build_prompt_fn=build_call_prompt,
+                deterministic_fn=_deterministic_call_decision,
+                valid_routes=CALL_ROUTES,
+            )
+            print(
+                f"{call['caller_name']:<14} -> route={result['route']:<14} "
+                f"source={result['source']:<8} model={result['model_used']}"
+            )
+            for step in result["reasoning_steps"]:
+                print(f"    • {step}")
+            print()
     else:
         print("No API key (env or .streamlit/secrets.toml) — exercising deterministic fallback path:\n")
+        print("=== Bill Shock ===")
         for cust in _SMOKE_CUSTOMERS:
             result = _deterministic_decision(cust)
             print(f"{cust['name']:<14} -> route={result['route']} (deterministic fallback)")
+        print("\n=== First Response ===")
+        for call in CALLS:
+            result = _deterministic_call_decision(call)
+            print(f"{call['caller_name']:<14} -> route={result['route']} (deterministic fallback)")

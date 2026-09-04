@@ -31,18 +31,45 @@ st.set_page_config(
     page_title="WattNext", page_icon="⚡", layout="centered",
     initial_sidebar_state="expanded",  # keep demo controls visible on stage
 )
+# The two demo modes. Value shown in the sidebar toggle.
+MODE_BILL = "⚡ Bill Shock"
+MODE_CALL = "🚨 First Response"
+
+# Header copy follows the active domain. The sidebar radio (key="mode") persists in
+# session_state across reruns; default to Bill Shock on the first render (before the
+# radio exists) so the header is never stale after a mode switch.
+_active_mode = st.session_state.get("mode", MODE_BILL)
 st.title("⚡ WattNext")
-st.subheader("The Kill Bill Shock Agent — Detect. Decide. Deliver.")
-st.caption(
-    "One real **Google Gemini** reasoning call resolves a customer's utility bill shock — "
-    "reaching a *different* resolution per customer. Everything else is mocked for the demo."
-)
+# Constant brand line — the flexible engine is the hero; the domain is just what it's pointed at.
+st.markdown("**One flexible agent for the utility contact center — point it at a new problem, it adapts.**")
+if _active_mode == MODE_CALL:
+    st.subheader("First-Response Triage Agent — Detect. Decide. Deliver.")
+    st.caption(
+        "One real **Google Gemini** reasoning call — constrained routes, human-in-the-loop. "
+        "The *same* engine that resolves bill shock is, right now, triaging an inbound gas-leak "
+        "call: a severity tier, a routing decision, and a dispatch packet handed to a **human "
+        "dispatcher** — never auto-dispatched. Everything else is mocked for the demo."
+    )
+else:
+    st.subheader("The Kill Bill Shock Agent — Detect. Decide. Deliver.")
+    st.caption(
+        "One real **Google Gemini** reasoning call — constrained routes, human-in-the-loop. "
+        "The *same* engine that triages a gas-leak call is, right now, resolving a customer's "
+        "bill shock — reaching a *different* resolution per customer. Everything else is mocked "
+        "for the demo."
+    )
 
 # Route → display styling (energy/utility theme).
+# Two domains share this map so _render_route_badge / _render_source_badge work for both.
 ROUTE_STYLE: Dict[str, Dict[str, str]] = {
+    # Bill Shock domain
     "ASSISTANCE_ENROLLMENT": {"bg": "#1B5E20", "icon": "🤝", "label": "Assistance Enrollment"},
     "BUDGET_BILLING":        {"bg": "#0D47A1", "icon": "📊", "label": "Budget Billing (Level-Pay)"},
     "REVIEW":                {"bg": "#5D4037", "icon": "🔎", "label": "Escalated for Human Review"},
+    # First Response domain
+    "DISPATCH_NOW":          {"bg": "#B71C1C", "icon": "🚑", "label": "Dispatch Emergency Responder"},
+    "SCHEDULE_TECH":         {"bg": "#0D47A1", "icon": "🔧", "label": "Schedule Technician (Non-Emergency)"},
+    "ESCALATE_HUMAN":        {"bg": "#5D4037", "icon": "🧑‍✈️", "label": "Escalate to Human Dispatcher"},
 }
 
 # Per-step reveal delay for the live decision log. Trim to 0.3 if the W5
@@ -94,8 +121,16 @@ for _key, _default in [
 
 
 def _select_customer(idx: int) -> None:
-    """Pick a customer and clear any prior decision so the loop restarts clean."""
+    """Pick a record and clear any prior decision so the loop restarts clean."""
     st.session_state.selected = idx
+    st.session_state.decision = None
+    st.session_state.log_done = False
+    st.session_state.deliver_status = "pending"
+
+
+def _reset_loop() -> None:
+    """Clear the whole loop back to the empty state (used by Reset and mode switch)."""
+    st.session_state.selected = None
     st.session_state.decision = None
     st.session_state.log_done = False
     st.session_state.deliver_status = "pending"
@@ -106,21 +141,36 @@ def _select_customer(idx: int) -> None:
 # ============================================================
 with st.sidebar:
     st.header("🎬 Demo Controls")
+
+    # Domain toggle — same DETECT→DECIDE→DELIVER engine, two triage domains.
+    # Switching modes clears the loop so the two demos never bleed into each other.
+    mode = st.radio(
+        "Triage domain",
+        [MODE_BILL, MODE_CALL],
+        key="mode",
+        on_change=_reset_loop,
+        help="Same agent engine, two domains. Bill Shock resolves billing; "
+             "First Response triages inbound gas-odor/leak calls.",
+    )
     st.caption("One-click scenarios for the live pitch.")
 
-    if st.button("🔴 Customer A: Maria (low-income, medical)", use_container_width=True):
-        _select_customer(0)
-        st.rerun()
-
-    if st.button("🟢 Customer B: James (seasonal AC)", use_container_width=True):
-        _select_customer(1)
-        st.rerun()
+    if mode == MODE_BILL:
+        if st.button("🔴 Customer A: Maria (low-income, medical)", use_container_width=True):
+            _select_customer(0)
+            st.rerun()
+        if st.button("🟢 Customer B: James (seasonal AC)", use_container_width=True):
+            _select_customer(1)
+            st.rerun()
+    else:
+        if st.button("🔴 Call A: Rosa (active leak, oxygen-dependent)", use_container_width=True):
+            _select_customer(0)
+            st.rerun()
+        if st.button("🟢 Call B: Trevor (faint odor, no danger)", use_container_width=True):
+            _select_customer(1)
+            st.rerun()
 
     if st.button("↺ Reset", use_container_width=True):
-        st.session_state.selected = None
-        st.session_state.decision = None
-        st.session_state.log_done = False
-        st.session_state.deliver_status = "pending"
+        _reset_loop()
         st.rerun()
 
     st.divider()
@@ -160,6 +210,31 @@ color:#FFFFFF;margin-bottom:0.5rem;">
     c1.metric("Income band", str(cust.get("income_band")).title())
     c2.metric("Medical equipment", "Yes" if cust.get("medical_equipment") else "No")
     c3.metric("Declared hardship", "Yes" if cust.get("hardship") else "No")
+
+
+def _render_detect_call(call: Dict[str, Any]) -> None:
+    """DETECT for the First Response domain — the raw inbound gas-odor/leak call."""
+    vuln = call.get("account_vulnerability_flag")
+    # Red banner: every inbound gas-odor call is treated as potentially life-safety
+    # until the agent triages it.
+    st.markdown(
+        f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;background:#B71C1C;
+color:#FFFFFF;margin-bottom:0.5rem;">
+  <div style="font-size:1.15rem;font-weight:800;">📞 INCOMING GAS-ODOR CALL — {call.get('caller_name')}</div>
+  <div style="font-size:1.05rem;font-weight:700;margin:0.15rem 0;">📍 {call.get('address')}</div>
+  <div style="margin-top:0.35rem;font-weight:500;opacity:0.95;">Awaiting triage — nothing dispatched until a human dispatcher confirms.</div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+    st.markdown("**📝 Call transcript (raw)**")
+    st.markdown(
+        f"""<div style="padding:0.75rem 1rem;border-radius:0.5rem;border-left:4px solid #B71C1C;
+background:rgba(0,0,0,0.03);font-style:italic;">{call.get('transcript')}</div>""",
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns(2)
+    c1.metric("Medical-dependent household", "Yes" if call.get("medical_dependent") else "No")
+    c2.metric("Vulnerability flag", vuln if vuln else "None")
 
 
 # ============================================================
@@ -290,16 +365,106 @@ background:rgba(0,0,0,0.03);">
             st.rerun()
 
 
+# ------------------------------------------------------------------
+# First Response DELIVER — the dispatch packet, handed to a HUMAN
+# dispatcher. Never auto-dispatched: that human-in-the-loop step is
+# the deliberate safety story for a life-safety call.
+# ------------------------------------------------------------------
+_SEVERITY_COLOR = {
+    "CRITICAL": "#B71C1C", "HIGH": "#E65100", "LOW": "#0D47A1", "NEEDS_REVIEW": "#5D4037",
+}
+
+
+def _render_deliver_call(decision: Dict[str, Any], call: Dict[str, Any]) -> None:
+    route = decision["route"]
+    style = ROUTE_STYLE.get(route, ROUTE_STYLE["ESCALATE_HUMAN"])
+    packet = (decision.get("action_params", {}) or {}).get("dispatch_packet", {}) or {}
+    severity = packet.get("severity_tier", "NEEDS_REVIEW")
+    sev_color = _SEVERITY_COLOR.get(severity, "#5D4037")
+    ref = _confirmation_number(route, {"name": call.get("caller_name", "")})
+
+    st.markdown("### 📦 Deliver — dispatch packet")
+    status = st.session_state.deliver_status
+
+    packet_rows = f"""
+  <div style="margin-top:0.5rem;"><b>Severity tier:</b>
+    <span style="background:{sev_color};color:#FFF;padding:0.1rem 0.5rem;border-radius:0.4rem;font-weight:800;">{severity}</span></div>
+  <div style="margin-top:0.3rem;"><b>Address:</b> {packet.get('address','—')}</div>
+  <div style="margin-top:0.3rem;"><b>Vulnerability flags:</b> {packet.get('vulnerability_flags','none')}</div>
+  <div style="margin-top:0.3rem;"><b>Responder brief:</b> {packet.get('responder_summary','—')}</div>"""
+
+    if status == "pending":
+        # Triaged and prepared, awaiting the dispatcher's decision.
+        st.markdown(
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px dashed {style['bg']};
+background:rgba(0,0,0,0.02);">
+  <div style="font-size:1.05rem;font-weight:800;color:{style['bg']};">{style['icon']} {style['label']}</div>
+  <div style="margin-top:0.2rem;opacity:0.9;">{decision.get('rationale','')}</div>
+  {packet_rows}
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['bg']};">🧾 Packet prepared — dispatcher's call</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption("The agent triaged the call and prepared the packet. **Nothing is dispatched until a human dispatcher confirms.**")
+        col_go, col_hold = st.columns(2)
+        if col_go.button("🚑 Dispatch responder", type="primary", use_container_width=True, key="dispatch_action"):
+            st.session_state.deliver_status = "dispatched"
+            st.rerun()
+        if col_hold.button("✋ Hold & review", use_container_width=True, key="hold_action"):
+            st.session_state.deliver_status = "held"
+            st.rerun()
+
+    elif status == "dispatched":
+        st.markdown(
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {style['bg']};
+background:rgba(0,0,0,0.03);">
+  <div style="font-size:1.05rem;font-weight:800;color:{style['bg']};">{style['icon']} {style['label']}</div>
+  {packet_rows}
+  <div style="margin-top:0.3rem;"><b>Dispatch ref #:</b> <code>{ref}</code></div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['bg']};">✅ Dispatcher confirmed — packet sent to responder</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption("DELIVER is mocked — in production, confirmation pages the on-call responder with this packet.")
+
+    else:  # held → nothing dispatched, dispatcher will review
+        review = ROUTE_STYLE["ESCALATE_HUMAN"]
+        st.markdown(
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {review['bg']};
+background:rgba(0,0,0,0.03);">
+  <div style="font-size:1.05rem;font-weight:800;color:{review['bg']};">{review['icon']} Held for dispatcher review</div>
+  <div style="margin-top:0.4rem;">No responder was dispatched. A dispatcher will review the packet before any action.</div>
+  <div style="margin-top:0.2rem;"><b>Reference #:</b> <code>{ref}</code></div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{review['bg']};">✋ Awaiting human dispatcher</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption("A held call is never dropped — it waits on a human, with nothing dispatched.")
+        if st.button("↩ Reconsider", use_container_width=True, key="reconsider_call_action"):
+            st.session_state.deliver_status = "pending"
+            st.rerun()
+
+
 # ============================================================
 # 7) MAIN LAYOUT
 # ============================================================
+# Branch on the active domain. The DECIDE stage (decision log) is shared; only the
+# record source, DETECT card, DELIVER card, and decide() bindings differ.
+is_call = st.session_state.mode == MODE_CALL
+
 if st.session_state.selected is None:
-    st.info("👈 Pick a customer from the sidebar to detect their bill shock.")
+    hint = ("👈 Pick a call from the sidebar to triage it."
+            if is_call else
+            "👈 Pick a customer from the sidebar to detect their bill shock.")
+    st.info(hint)
     st.stop()
 
-cust = agent.CUSTOMERS[st.session_state.selected]
-
-_render_detect(cust)
+if is_call:
+    rec = agent.CALLS[st.session_state.selected]
+    _render_detect_call(rec)
+else:
+    rec = agent.CUSTOMERS[st.session_state.selected]
+    _render_detect(rec)
 
 run = st.button("⚡ Run Agent", type="primary", use_container_width=True)
 
@@ -307,10 +472,18 @@ run = st.button("⚡ Run Agent", type="primary", use_container_width=True)
 if run:
     with st.spinner(f"Reasoning… (real Gemini call · {agent.PRIMARY_MODEL})"):
         _t0 = time.time()
-        st.session_state.decision = agent.decide(st.session_state.client, cust)
+        if is_call:
+            st.session_state.decision = agent.decide(
+                st.session_state.client, rec,
+                build_prompt_fn=agent.build_call_prompt,
+                deterministic_fn=agent._deterministic_call_decision,
+                valid_routes=agent.CALL_ROUTES,
+            )
+        else:
+            st.session_state.decision = agent.decide(st.session_state.client, rec)
         st.session_state.decision_latency = round(time.time() - _t0, 2)
     st.session_state.log_done = False            # replay the reveal for this fresh decision
-    st.session_state.deliver_status = "pending"  # new decision → awaiting customer choice
+    st.session_state.deliver_status = "pending"  # new decision → awaiting the human decision
 
 decision = st.session_state.decision
 if decision:
@@ -327,7 +500,10 @@ if decision:
             st.markdown(f"- {step}")
 
     _render_route_badge(decision)
-    _render_deliver(decision, cust)
+    if is_call:
+        _render_deliver_call(decision, rec)
+    else:
+        _render_deliver(decision, rec)
 
 
 # ============================================================
@@ -339,11 +515,15 @@ if any([show_profile, show_prompt, show_routes, show_json, show_meta]):
     st.markdown("### 🧪 Debug / Evidence")
 
 if show_profile:
-    st.markdown("**🗂️ Customer profile — raw mock input (the DETECT source)**")
-    st.json(cust)
+    label = "Call record" if is_call else "Customer profile"
+    st.markdown(f"**🗂️ {label} — raw mock input (the DETECT source)**")
+    st.json(rec)
 
 if show_prompt:
-    _sys_i, _user_c = agent.build_prompt(cust)
+    if is_call:
+        _sys_i, _user_c = agent.build_call_prompt(rec)
+    else:
+        _sys_i, _user_c = agent.build_prompt(rec)
     st.markdown("**📨 Prompt sent to Gemini — the slim payload the model actually saw**")
     st.caption("System instruction")
     st.code(_sys_i, language="text")
@@ -351,8 +531,9 @@ if show_prompt:
     st.code(_user_c, language="text")
 
 if show_routes:
+    _routes = agent.CALL_ROUTES if is_call else agent.ROUTES
     st.markdown("**🛡️ Allowed routes — constrained enum; the model cannot invent a route**")
-    st.code("\n".join(sorted(agent.ROUTES)), language="text")
+    st.code("\n".join(sorted(_routes)), language="text")
 
 if show_json:
     if decision:
