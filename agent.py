@@ -452,22 +452,29 @@ def transcribe_call(client: genai.Client, audio_bytes: bytes, mime_type: str = "
 
 
 def find_signals(transcript: str) -> dict:
-    """Return the active-danger / low-signal keywords present (negation-aware) in a transcript.
+    """Return the danger / low-signal / ambiguous-hazard keywords present (negation-aware).
 
-    Powers the live danger-signal dashboard: which words made the agent escalate, and
-    how many. Hazard-agnostic (gas, electrical, fire, symptoms). Uses the same _mentions()
-    logic decide()'s fallback uses, so the on-screen signals match the routing rationale —
-    nothing is highlighted that was negated (e.g. "no hissing" is neither counted nor shown).
+    Powers the live danger-signal dashboard: which words made the agent escalate, and how
+    many. Three tiers, mirroring decide()'s deterministic precedence:
+      - danger     : an active-hazard indicator (governs the routing decision)
+      - low_signal : an advisory complaint with no active-danger indicator
+      - ambiguous  : a hazard is named but unconfirmed — only surfaced when NO active
+                     danger is present, since danger short-circuits the routing anyway
+    Hazard-agnostic (gas, electrical, fire, symptoms). Uses the same _mentions() logic
+    decide()'s fallback uses, so on-screen signals match the routing rationale — nothing
+    negated (e.g. "no hissing") is counted or shown.
     """
     t = (transcript or "").lower()
     danger = sorted({k for k in ACTIVE_DANGER_KEYWORDS if _mentions(t, [k])})
     low_signal = sorted({k for k in LOW_SIGNAL_KEYWORDS if _mentions(t, [k])})
-    ambiguous = sorted({k for k in AMBIGUOUS_HAZARD_KEYWORDS if _mentions(t, [k])})
-    # Drop ambiguous cues subsumed by a more specific matched cue — e.g. bare "leak"
-    # inside "confirmed leak" (danger) or "gas leak" (ambiguous) — so the ambiguous tier
-    # shows only genuinely under-specified hazards, not redundant fragments.
-    _more_specific = set(danger) | set(ambiguous)
-    ambiguous = [k for k in ambiguous if not any(k != o and k in o for o in _more_specific)]
+    # Ambiguous cues are decision-relevant only when there's no active danger (danger is
+    # matched first and governs). Suppressing them under danger also stops the dashboard
+    # from showing an "ambiguous" chip with no matching transcript highlight on a clear
+    # active-danger call (e.g. "smell of gas" beside "strong smell").
+    ambiguous = sorted({k for k in AMBIGUOUS_HAZARD_KEYWORDS if _mentions(t, [k])}) if not danger else []
+    # Drop cues subsumed by a longer matched cue — e.g. bare "leak" inside "gas leak" —
+    # so the tier shows only genuinely under-specified hazards, not redundant fragments.
+    ambiguous = [k for k in ambiguous if not any(k != o and k in o for o in ambiguous)]
     return {"danger": danger, "low_signal": low_signal, "ambiguous": ambiguous}
 
 

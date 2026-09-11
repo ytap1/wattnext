@@ -15,6 +15,7 @@ Run:  venv\\Scripts\\python.exe -m streamlit run live_demo.py
 import html
 import re
 import time
+from typing import Sequence
 
 import streamlit as st
 
@@ -99,7 +100,7 @@ for k, v in [("live_transcript", ""), ("live_audio_sig", None), ("live_decision"
 _TIER_COLOR = {"danger": "#B71C1C", "ambiguous": "#CA8A04", "odor": "#E65100"}
 
 
-def _highlight(transcript: str, danger: list, odor: list, ambiguous: list = ()) -> str:
+def _highlight(transcript: str, danger: list, odor: list, ambiguous: Sequence[str] = ()) -> str:
     """Wrap detected (non-negated) keywords in colored spans; escape everything else."""
     spans = (
         [(k, "danger") for k in danger]
@@ -124,7 +125,7 @@ def _highlight(transcript: str, danger: list, odor: list, ambiguous: list = ()) 
     return "".join(out)
 
 
-def _preview_severity(danger: list, odor: list, vulnerable: bool, ambiguous: list = ()) -> str:
+def _preview_severity(danger: list, odor: list, vulnerable: bool, ambiguous: Sequence[str] = ()) -> str:
     """Signal-only severity preview — mirrors decide()'s deterministic tiering."""
     if danger and vulnerable:
         return "CRITICAL"
@@ -203,6 +204,15 @@ if transcript:
     vulnerable = bool(call_record.get("account_vulnerability_flag")) or bool(call_record.get("medical_dependent"))
     sev = _preview_severity(danger, odor, vulnerable, ambiguous)
 
+    # Once triaged, show the DECIDED severity rather than the keyword-only preview — avoids
+    # an on-screen contradiction with the triage decision below.
+    decided = st.session_state.live_decision
+    if decided:
+        sev = (decided.get("action_params", {}) or {}).get("dispatch_packet", {}).get("severity_tier", sev)
+        sev_label = "SIGNAL SEVERITY"
+    else:
+        sev_label = "SIGNAL SEVERITY (preview)"
+
     st.markdown("### 2 · Danger-signal dashboard")
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Active-danger signals", len(danger))
@@ -215,7 +225,7 @@ if transcript:
     st.markdown(
         f"""<div style="display:inline-block;padding:0.35rem 0.8rem;border-radius:0.5rem;
 background:{SEV_COLOR.get(sev)};color:#fff;font-weight:800;margin:0.2rem 0 0.6rem;">
-SIGNAL SEVERITY (preview): {sev}</div>""",
+{sev_label}: {sev}</div>""",
         unsafe_allow_html=True,
     )
 

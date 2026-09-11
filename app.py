@@ -20,7 +20,7 @@ import html
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Sequence
 
 import streamlit as st
 
@@ -347,7 +347,7 @@ _SIGNAL_SEVERITY_COLOR = {
 _SIGNAL_TIER_COLOR = {"danger": "#B71C1C", "ambiguous": "#CA8A04", "advisory": "#E65100"}
 
 
-def _preview_severity(danger: list, advisory: list, vulnerable: bool, ambiguous: list = ()) -> str:
+def _preview_severity(danger: list, advisory: list, vulnerable: bool, ambiguous: Sequence[str] = ()) -> str:
     """Signal-only severity preview — mirrors decide()'s deterministic tiering."""
     if danger and vulnerable:
         return "CRITICAL"
@@ -360,7 +360,7 @@ def _preview_severity(danger: list, advisory: list, vulnerable: bool, ambiguous:
     return "NEEDS_REVIEW"
 
 
-def _highlight(transcript: str, danger: list, advisory: list, ambiguous: list = ()) -> str:
+def _highlight(transcript: str, danger: list, advisory: list, ambiguous: Sequence[str] = ()) -> str:
     """Wrap detected (non-negated) keywords in colored spans; escape everything else."""
     spans = (
         [(k, "danger") for k in danger]
@@ -405,18 +405,28 @@ def _render_signal_dashboard(call: Dict[str, Any]) -> None:
     vulnerable = bool(call.get("account_vulnerability_flag")) or bool(call.get("medical_dependent"))
     sev = _preview_severity(danger, advisory, vulnerable, ambiguous)
 
+    # Once triaged, show the DECIDED severity (from the real decision) rather than the
+    # keyword-only preview — otherwise the preview could contradict the decision log below
+    # (e.g. preview "NEEDS_REVIEW" over a decision that dispatched).
+    decided = st.session_state.decision
+    if decided:
+        sev = (decided.get("action_params", {}) or {}).get("dispatch_packet", {}).get("severity_tier", sev)
+        sev_label = "SIGNAL SEVERITY"
+    else:
+        sev_label = "SIGNAL SEVERITY (preview)"
+
     st.markdown("### 📡 Danger-signal dashboard")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Active-danger signals", len(danger))
     m2.metric("Ambiguous hazard", len(ambiguous))
     m3.metric("Advisory signals", len(advisory))
     lat = st.session_state.decision_latency
-    m4.metric("Time-to-triage", f"{lat:.2f}s" if (lat and st.session_state.decision) else "—")
+    m4.metric("Time-to-triage", f"{lat:.2f}s" if (lat and decided) else "—")
 
     st.markdown(
         f"""<div style="display:inline-block;padding:0.35rem 0.8rem;border-radius:0.5rem;
 background:{_SIGNAL_SEVERITY_COLOR.get(sev)};color:#fff;font-weight:800;margin:0.1rem 0 0.5rem;">
-SIGNAL SEVERITY (preview): {sev}</div>""",
+{sev_label}: {sev}</div>""",
         unsafe_allow_html=True,
     )
     st.markdown("**📝 Transcript — active-danger in red, ambiguous hazard in gold, advisory in orange**")
