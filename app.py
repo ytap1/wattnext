@@ -16,8 +16,11 @@ Everything is mocked EXCEPT the single agent.decide() Gemini call.
 """
 
 import hashlib
+import html
+import re
 import time
-from typing import Any, Dict, Iterator
+from pathlib import Path
+from typing import Any, Dict, Iterator, Sequence
 
 import streamlit as st
 
@@ -27,22 +30,131 @@ import agent
 # ============================================================
 # 0) PAGE SETUP + THEME
 # ============================================================
+# Brand assets (see brand/brand-spec.md). Resolved from this file's location so
+# paths hold no matter the working directory `streamlit run` is launched from.
+_BRAND = Path(__file__).parent / "brand"
+_FAVICON = str(_BRAND / "favicons" / "icon-192.png")
+_LOGO_CHROME = str(_BRAND / "wattnext-lockup-mono-white.svg")  # top-left chrome lockup (dark surface)
+_MARK = str(_BRAND / "wattnext-mark.svg")  # pulse symbol only (transparent) — hero side mark
+
 st.set_page_config(
-    page_title="WattNext", page_icon="⚡", layout="centered",
+    page_title="WattNext", page_icon=_FAVICON, layout="centered",
     initial_sidebar_state="expanded",  # keep demo controls visible on stage
 )
-st.title("⚡ WattNext")
-st.subheader("The Kill Bill Shock Agent — Detect. Decide. Deliver.")
-st.caption(
-    "One real **Google Gemini** reasoning call resolves a customer's utility bill shock — "
-    "reaching a *different* resolution per customer. Everything else is mocked for the demo."
+# Brand mark in the top-left chrome (app + sidebar corner).
+st.logo(_LOGO_CHROME, icon_image=_MARK)
+# Global polish. Streamlit has no CSS layer to edit, so inject once: tighter top gap,
+# higher caption contrast on the Ink surface, and inputs that read as intentional controls.
+st.markdown(
+    """<style>
+  .block-container { padding-top: 2.5rem; }
+  /* Caption text — lift off Streamlit's muted default for readability on dark Ink. */
+  [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color:#A8B5C6 !important; }
+  /* Inputs/selects — a visible slate border so empty fields don't read as voids. */
+  .stTextInput input,
+  .stSelectbox div[data-baseweb="select"] > div {
+    border: 1px solid #334155 !important;
+  }
+  /* Trim heading top-margins so the hero stack sits tighter. */
+  h2, h3 { margin-top: 0.6rem !important; }
+  /* Hide Streamlit's hover anchor-link icon next to headers (visual clutter on stage). */
+  [data-testid="stHeaderActionElements"] { display: none !important; }
+</style>""",
+    unsafe_allow_html=True,
+)
+# The two demo modes. Value shown in the sidebar toggle.
+MODE_BILL = "⚡ Bill Shock"
+MODE_CALL = "🚨 First Response"
+
+# First Response call sources — a canned demo call, or a live mic recording.
+SOURCE_CANNED = "📼 Canned call"
+SOURCE_LIVE = "🎙️ Live mic"
+
+# Account vulnerability flags for the live-capture dropdown. "None" is the empty sentinel
+# (mapped to "" at the call site) so downstream truthiness checks stay unchanged.
+VULN_OPTIONS = ["None", "Medical / life-support", "Elderly / mobility", "Disability"]
+
+# Header copy follows the active domain. The sidebar radio (key="mode") persists in
+# session_state across reruns; default to First Response (the hero domain) on the first
+# render (before the radio exists) so the header is never stale after a mode switch.
+_active_mode = st.session_state.get("mode", MODE_CALL)
+# Hero = pulse mark on the side + a large wordmark and tagline (brand colors on dark).
+_hero_mark, _hero_word = st.columns([1, 3.4], vertical_alignment="center")
+with _hero_mark:
+    st.image(_MARK, width=130)
+with _hero_word:
+    st.markdown(
+        """<div style="display:inline-block;line-height:1;">
+  <div style="font-size:3.6rem;font-weight:800;letter-spacing:-1px;">
+    <span style="color:#F8FAFC;">Watt</span><span style="color:#22D3EE;">Next</span>
+  </div>
+  <div style="font-size:1.02rem;font-weight:600;color:#38BDF8;margin-top:0.5rem;
+              text-align:justify;text-align-last:justify;">
+    DETECT · DECIDE · DELIVER
+  </div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+# Constant brand line — the flexible engine is the hero; the domain is just what it's pointed at.
+st.markdown("**One flexible agent for the utility contact center — point it at a new problem, it adapts.**")
+if _active_mode == MODE_CALL:
+    st.subheader("First-Response Triage Agent")
+    st.caption(
+        "One real **Google Gemini** reasoning call — severity tier, routing decision, and a "
+        "dispatch packet. The *same* engine that resolves bill shock, pointed at a hazard call."
+    )
+else:
+    st.subheader("The Kill Bill Shock Agent")
+    st.caption(
+        "One real **Google Gemini** reasoning call — a *different* resolution per customer. "
+        "The *same* engine that triages a hazard call, pointed at bill shock."
+    )
+# Surface the trust signal as a visible chip, not buried gray text — it's the strongest
+# credibility point for a utility-hazard use case.
+_trust_line = (
+    "Human-in-the-loop · never auto-dispatched" if _active_mode == MODE_CALL
+    else "Human-in-the-loop · human approves every resolution"
+)
+st.markdown(
+    f"""<div style="display:inline-block;margin:0.15rem 0 0.25rem;padding:0.3rem 0.7rem;
+border-radius:999px;background:#1E293B;border:1px solid #334155;
+color:#22D3EE;font-size:0.85rem;font-weight:600;">
+  🔒 {_trust_line}
+</div>""",
+    unsafe_allow_html=True,
+)
+# The flexibility/scalability proof, made visible: the engine is CONSTANT across domains —
+# only the prompt + route list change. Rendered in BOTH modes so "same engine, retargeted"
+# is an on-screen fact, not just a spoken claim. The domain pill tracks the sidebar toggle.
+st.markdown(
+    f"""<div style="margin:0.4rem 0 0.3rem;padding:0.7rem 0.95rem;border-radius:0.6rem;
+background:#111C31;border:1px solid #334155;border-left:4px solid #22D3EE;">
+  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.5rem;
+              font-size:0.95rem;font-weight:700;color:#E2E8F0;">
+    <span>⚙️ One engine · <code style="color:#22D3EE;background:transparent;padding:0;">agent.decide()</code></span>
+    <span style="color:#64748B;">→ now pointed at</span>
+    <span style="padding:0.1rem 0.55rem;border-radius:999px;background:#1E293B;
+                 border:1px solid #334155;color:#38BDF8;font-size:0.85rem;font-weight:600;">{_active_mode}</span>
+  </div>
+  <div style="margin-top:0.35rem;font-size:0.82rem;color:#94A3B8;">
+    Retarget to a new problem = swap the prompt + route list. No new model, no new pipeline.
+  </div>
+</div>""",
+    unsafe_allow_html=True,
 )
 
-# Route → display styling (energy/utility theme).
+# Route → display styling (energy/utility theme). `bg` = solid badge fill (white text on
+# it); `fg` = a brightened tint of the same hue for text/borders that must read on the
+# dark Ink surface. Two domains share this map so the render helpers work for both.
 ROUTE_STYLE: Dict[str, Dict[str, str]] = {
-    "ASSISTANCE_ENROLLMENT": {"bg": "#1B5E20", "icon": "🤝", "label": "Assistance Enrollment"},
-    "BUDGET_BILLING":        {"bg": "#0D47A1", "icon": "📊", "label": "Budget Billing (Level-Pay)"},
-    "REVIEW":                {"bg": "#5D4037", "icon": "🔎", "label": "Escalated for Human Review"},
+    # Bill Shock domain
+    "ASSISTANCE_ENROLLMENT": {"bg": "#1B5E20", "fg": "#4ADE80", "icon": "🤝", "label": "Assistance Enrollment"},
+    "BUDGET_BILLING":        {"bg": "#0D47A1", "fg": "#60A5FA", "icon": "📊", "label": "Budget Billing (Level-Pay)"},
+    "REVIEW":                {"bg": "#5D4037", "fg": "#D6B08C", "icon": "🔎", "label": "Escalated for Human Review"},
+    # First Response domain
+    "DISPATCH_NOW":          {"bg": "#B71C1C", "fg": "#F87171", "icon": "🚑", "label": "Dispatch Emergency Responder"},
+    "SCHEDULE_TECH":         {"bg": "#0D47A1", "fg": "#60A5FA", "icon": "🔧", "label": "Schedule Technician (Non-Emergency)"},
+    "ESCALATE_HUMAN":        {"bg": "#5D4037", "fg": "#D6B08C", "icon": "🧑‍✈️", "label": "Escalate to Human Dispatcher"},
 }
 
 # Per-step reveal delay for the live decision log. Trim to 0.3 if the W5
@@ -83,22 +195,37 @@ if "client" not in st.session_state:
 # 2) SESSION STATE INIT
 # ============================================================
 for _key, _default in [
-    ("selected", None),      # index into agent.CUSTOMERS, or None
+    ("selected", None),      # index into agent.CUSTOMERS/CALLS, or None
     ("decision", None),      # last decision dict, or None
     ("log_done", False),            # whether the staged reveal has already played
     ("deliver_status", "pending"),  # pending | accepted | declined
     ("decision_latency", None),     # seconds the live DECIDE call took
+    ("live_transcript", ""),        # Gemini transcription of the recorded call
+    ("live_audio_sig", None),       # hash of the last transcribed audio (avoid re-calling)
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
 
 
-def _select_customer(idx: int) -> None:
-    """Pick a customer and clear any prior decision so the loop restarts clean."""
-    st.session_state.selected = idx
+def _clear_decision() -> None:
+    """Reset just the DECIDE/DELIVER state (a fresh record → replay the loop)."""
     st.session_state.decision = None
     st.session_state.log_done = False
     st.session_state.deliver_status = "pending"
+
+
+def _select_customer(idx: int) -> None:
+    """Pick a record and clear any prior decision so the loop restarts clean."""
+    st.session_state.selected = idx
+    _clear_decision()
+
+
+def _reset_loop() -> None:
+    """Clear the whole loop back to the empty state (used by Reset, mode/source switch)."""
+    st.session_state.selected = None
+    st.session_state.live_transcript = ""
+    st.session_state.live_audio_sig = None
+    _clear_decision()
 
 
 # ============================================================
@@ -106,21 +233,47 @@ def _select_customer(idx: int) -> None:
 # ============================================================
 with st.sidebar:
     st.header("🎬 Demo Controls")
+
+    # Domain toggle — same DETECT→DECIDE→DELIVER engine, two triage domains.
+    # Switching modes clears the loop so the two demos never bleed into each other.
+    mode = st.radio(
+        "Triage domain",
+        [MODE_CALL, MODE_BILL],  # First Response first — it's the hero domain / default
+        key="mode",
+        on_change=_reset_loop,
+        help="Same agent engine, two domains. First Response triages inbound "
+             "utility-hazard calls (gas, electrical, and more); Bill Shock resolves billing.",
+    )
     st.caption("One-click scenarios for the live pitch.")
 
-    if st.button("🔴 Customer A: Maria (low-income, medical)", use_container_width=True):
-        _select_customer(0)
-        st.rerun()
-
-    if st.button("🟢 Customer B: James (seasonal AC)", use_container_width=True):
-        _select_customer(1)
-        st.rerun()
+    if mode == MODE_BILL:
+        if st.button("🔴 Customer A: Maria (low-income, medical)", use_container_width=True):
+            _select_customer(0)
+            st.rerun()
+        if st.button("🟢 Customer B: James (seasonal AC)", use_container_width=True):
+            _select_customer(1)
+            st.rerun()
+    else:
+        # Canned demo call, or a live recording transcribed by Gemini.
+        call_source = st.radio(
+            "Call source", [SOURCE_CANNED, SOURCE_LIVE],
+            key="call_source", on_change=_reset_loop, horizontal=True,
+        )
+        if call_source == SOURCE_CANNED:
+            if st.button("🔴 Call A: Rosa (active leak, oxygen-dependent)", use_container_width=True):
+                _select_customer(0)
+                st.rerun()
+            if st.button("🟢 Call B: Trevor (faint odor, no danger)", use_container_width=True):
+                _select_customer(1)
+                st.rerun()
+            if st.button("🟠 Call C: Marcus (downed power line, sparks)", use_container_width=True):
+                _select_customer(2)
+                st.rerun()
+        else:
+            st.caption("🎙️ Record the caller in the main panel →")
 
     if st.button("↺ Reset", use_container_width=True):
-        st.session_state.selected = None
-        st.session_state.decision = None
-        st.session_state.log_done = False
-        st.session_state.deliver_status = "pending"
+        _reset_loop()
         st.rerun()
 
     st.divider()
@@ -160,6 +313,183 @@ color:#FFFFFF;margin-bottom:0.5rem;">
     c1.metric("Income band", str(cust.get("income_band")).title())
     c2.metric("Medical equipment", "Yes" if cust.get("medical_equipment") else "No")
     c3.metric("Declared hardship", "Yes" if cust.get("hardship") else "No")
+
+
+def _render_detect_call(call: Dict[str, Any]) -> None:
+    """DETECT for the First Response domain — the raw inbound utility-hazard call."""
+    vuln = call.get("account_vulnerability_flag")
+    # Red banner: every inbound hazard call is treated as potentially life-safety
+    # until the agent triages it.
+    st.markdown(
+        f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;background:#B71C1C;
+color:#FFFFFF;margin-bottom:0.5rem;">
+  <div style="font-size:1.15rem;font-weight:800;">📞 INCOMING HAZARD CALL — {call.get('caller_name')}</div>
+  <div style="font-size:1.05rem;font-weight:700;margin:0.15rem 0;">📍 {call.get('address')}</div>
+  <div style="margin-top:0.35rem;font-weight:500;opacity:0.95;">Awaiting triage — nothing dispatched until a human dispatcher confirms.</div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns(2)
+    c1.metric("Medical-dependent household", "Yes" if call.get("medical_dependent") else "No")
+    c2.metric("Vulnerability flag", vuln if vuln else "None")
+
+
+# ------------------------------------------------------------------
+# First Response — live-voice capture + danger-signal dashboard.
+# No voice biometrics: every metric traces to a word actually said.
+# ------------------------------------------------------------------
+_SIGNAL_SEVERITY_COLOR = {
+    "CRITICAL": "#B71C1C", "HIGH": "#E65100", "LOW": "#0D47A1", "NEEDS_REVIEW": "#5D4037",
+}
+
+
+# Signal-tier colors — red = active danger, gold = named-but-unconfirmed hazard, orange = advisory.
+_SIGNAL_TIER_COLOR = {"danger": "#B71C1C", "ambiguous": "#CA8A04", "advisory": "#E65100"}
+
+
+def _preview_severity(danger: list, advisory: list, vulnerable: bool, ambiguous: Sequence[str] = ()) -> str:
+    """Signal-only severity preview — mirrors decide()'s deterministic tiering."""
+    if danger and vulnerable:
+        return "CRITICAL"
+    if danger:
+        return "HIGH"
+    if ambiguous:  # named hazard, no confirming detail -> human review, never a guess
+        return "NEEDS_REVIEW"
+    if advisory:
+        return "LOW"
+    return "NEEDS_REVIEW"
+
+
+def _highlight(transcript: str, danger: list, advisory: list, ambiguous: Sequence[str] = ()) -> str:
+    """Wrap detected (non-negated) keywords in colored spans; escape everything else."""
+    spans = (
+        [(k, "danger") for k in danger]
+        + [(k, "ambiguous") for k in ambiguous]
+        + [(k, "advisory") for k in advisory]
+    )
+    if not spans:
+        return html.escape(transcript)
+    spans.sort(key=lambda kv: len(kv[0]), reverse=True)  # longest first: "strong smell" before "smell"
+    kind_of = {k.lower(): kind for k, kind in spans}
+    pattern = re.compile("|".join(re.escape(k) for k, _ in spans), re.IGNORECASE)
+    out, last = [], 0
+    for m in pattern.finditer(transcript):
+        out.append(html.escape(transcript[last:m.start()]))
+        bg = _SIGNAL_TIER_COLOR.get(kind_of.get(m.group(0).lower()), "#E65100")
+        out.append(
+            f'<span style="background:{bg};color:#fff;padding:0 4px;border-radius:4px;'
+            f'font-weight:700;">{html.escape(m.group(0))}</span>'
+        )
+        last = m.end()
+    out.append(html.escape(transcript[last:]))
+    return "".join(out)
+
+
+def _chips(items: list, bg: str) -> str:
+    if not items:
+        return '<span style="opacity:0.6;">none detected</span>'
+    return " ".join(
+        f'<span style="display:inline-block;background:{bg};color:#fff;padding:2px 8px;'
+        f'border-radius:10px;font-size:0.8rem;font-weight:600;margin:2px;">{html.escape(c)}</span>'
+        for c in items
+    )
+
+
+def _render_signal_dashboard(call: Dict[str, Any]) -> None:
+    """Live danger-signal dashboard — the transcript with signals highlighted, plus
+    counts, a severity preview, and (once triaged) the real time-to-decision."""
+    transcript = call.get("transcript") or ""
+    signals = agent.find_signals(transcript)
+    danger, advisory = signals["danger"], signals["low_signal"]
+    ambiguous = signals.get("ambiguous", [])
+    vulnerable = bool(call.get("account_vulnerability_flag")) or bool(call.get("medical_dependent"))
+    sev = _preview_severity(danger, advisory, vulnerable, ambiguous)
+
+    # Once triaged, show the DECIDED severity (from the real decision) rather than the
+    # keyword-only preview — otherwise the preview could contradict the decision log below
+    # (e.g. preview "NEEDS_REVIEW" over a decision that dispatched).
+    decided = st.session_state.decision
+    if decided:
+        sev = (decided.get("action_params", {}) or {}).get("dispatch_packet", {}).get("severity_tier", sev)
+        sev_label = "SIGNAL SEVERITY"
+    else:
+        sev_label = "SIGNAL SEVERITY (preview)"
+
+    st.markdown("### 📡 Danger-signal dashboard")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Active-danger signals", len(danger))
+    m2.metric("Ambiguous hazard", len(ambiguous))
+    m3.metric("Advisory signals", len(advisory))
+    lat = st.session_state.decision_latency
+    m4.metric("Time-to-triage", f"{lat:.2f}s" if (lat and decided) else "—")
+
+    st.markdown(
+        f"""<div style="display:inline-block;padding:0.35rem 0.8rem;border-radius:0.5rem;
+background:{_SIGNAL_SEVERITY_COLOR.get(sev)};color:#fff;font-weight:800;margin:0.1rem 0 0.5rem;">
+{sev_label}: {sev}</div>""",
+        unsafe_allow_html=True,
+    )
+    st.markdown("**📝 Transcript — active-danger in red, ambiguous hazard in gold, advisory in orange**")
+    st.markdown(
+        f"""<div style="padding:0.8rem 1rem;border-radius:0.5rem;border-left:4px solid #B71C1C;
+background:rgba(255,255,255,0.05);line-height:1.7;">{_highlight(transcript, danger, advisory, ambiguous)}</div>""",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"**Active-danger:** {_chips(danger, '#B71C1C')}", unsafe_allow_html=True)
+    st.markdown(f"**Ambiguous hazard:** {_chips(ambiguous, '#CA8A04')}", unsafe_allow_html=True)
+    st.markdown(f"**Advisory:** {_chips(advisory, '#E65100')}", unsafe_allow_html=True)
+    if ambiguous and not danger:
+        st.caption(
+            "A hazard is named but unconfirmed — no active-danger signal to dispatch on, "
+            "yet too risky to downgrade. The agent escalates to a human rather than guess."
+        )
+
+
+def _capture_live_call() -> "Dict[str, Any] | None":
+    """Render the mic + caller inputs, transcribe a fresh recording with Gemini, and
+    return a call record. Returns None while waiting for audio or on transcription failure."""
+    st.markdown("### 🎙️ Live call capture")
+    st.caption("Record the caller, then stop — Gemini transcribes what it heard.")
+    audio = st.audio_input("Record the caller", help="Mic needs localhost or HTTPS.")
+    c1, c2 = st.columns(2)
+    address = c1.text_input("Address (from caller ID / account)", value="418 Maple Street, Apt 2B", key="live_addr")
+    # A flag is a fixed set, not free text — a dropdown improves data quality. "None" maps to
+    # "" so the downstream truthiness (bool(vuln) / vuln or None) is unchanged.
+    vuln_choice = c2.selectbox(
+        "Account vulnerability flag (optional)", VULN_OPTIONS, key="live_vuln",
+    )
+    vuln = "" if vuln_choice == "None" else vuln_choice
+
+    if audio is None:
+        st.markdown(
+            """<div style="padding:0.85rem 1.1rem;border-radius:0.6rem;background:#1E293B;
+border-left:4px solid #22D3EE;color:#E2E8F0;font-weight:600;">
+  ↑ Record a call above to triage it.
+</div>""",
+            unsafe_allow_html=True,
+        )
+        return None
+
+    data = audio.getvalue()
+    sig = hash(data)
+    if sig != st.session_state.live_audio_sig:  # only transcribe a genuinely new recording
+        with st.spinner("Gemini is transcribing the call…"):
+            st.session_state.live_transcript = agent.transcribe_call(st.session_state.client, data)
+            st.session_state.live_audio_sig = sig
+            _clear_decision()  # new call → replay the loop
+
+    transcript = st.session_state.live_transcript
+    if not transcript:
+        st.warning("Transcription failed (audio or network). Try again, or switch to a canned call.")
+        return None
+
+    return {
+        "caller_name": "Live caller",
+        "address": address,
+        "transcript": transcript,
+        "medical_dependent": bool(vuln),
+        "account_vulnerability_flag": vuln or None,
+    }
 
 
 # ============================================================
@@ -239,12 +569,12 @@ def _render_deliver(decision: Dict[str, Any], cust: Dict[str, Any]) -> None:
     if status == "pending":
         # Prepared, awaiting the customer's CHOICE — real consent means a real option to decline.
         st.markdown(
-            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px dashed {style['bg']};
-background:rgba(0,0,0,0.02);">
-  <div style="font-size:1.05rem;font-weight:800;color:{style['bg']};">{style['icon']} {plan}</div>
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px dashed {style['fg']};
+background:rgba(255,255,255,0.05);">
+  <div style="font-size:1.05rem;font-weight:800;color:{style['fg']};">{style['icon']} {plan}</div>
   <div style="margin-top:0.4rem;"><b>{figure_label}:</b> {figure_val}</div>
   <div style="margin-top:0.2rem;opacity:0.8;">{params.get('note','')}</div>
-  <div style="margin-top:0.55rem;font-weight:800;color:{style['bg']};">🧾 Prepared — your choice</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">🧾 Prepared — your choice</div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -260,12 +590,12 @@ background:rgba(0,0,0,0.02);">
     elif status == "accepted":
         # Accepted → action completed, confirmation issued.
         st.markdown(
-            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {style['bg']};
-background:rgba(0,0,0,0.03);">
-  <div style="font-size:1.05rem;font-weight:800;color:{style['bg']};">{style['icon']} {plan}</div>
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {style['fg']};
+background:rgba(255,255,255,0.05);">
+  <div style="font-size:1.05rem;font-weight:800;color:{style['fg']};">{style['icon']} {plan}</div>
   <div style="margin-top:0.4rem;"><b>{figure_label}:</b> {figure_val}</div>
   <div style="margin-top:0.2rem;"><b>Confirmation #:</b> <code>{_confirmation_number(route, cust)}</code></div>
-  <div style="margin-top:0.55rem;font-weight:800;color:{style['bg']};">✅ Accepted &amp; enrolled — action completed</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">✅ Accepted &amp; enrolled — action completed</div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -274,13 +604,13 @@ background:rgba(0,0,0,0.03);">
     else:  # declined → human handoff (surfaces the REVIEW route in the enum)
         review = ROUTE_STYLE["REVIEW"]
         st.markdown(
-            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {review['bg']};
-background:rgba(0,0,0,0.03);">
-  <div style="font-size:1.05rem;font-weight:800;color:{review['bg']};">{review['icon']} Handed off to a WattNext specialist</div>
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {review['fg']};
+background:rgba(255,255,255,0.05);">
+  <div style="font-size:1.05rem;font-weight:800;color:{review['fg']};">{review['icon']} Handed off to a WattNext specialist</div>
   <div style="margin-top:0.4rem;">No account changes were made. A specialist will review your options with you.</div>
   <div style="margin-top:0.2rem;"><b>Reference #:</b> <code>{_confirmation_number('REVIEW', cust)}</code></div>
   <div style="margin-top:0.2rem;"><b>Callback:</b> within 24 hours</div>
-  <div style="margin-top:0.55rem;font-weight:800;color:{review['bg']};">💬 Escalated for human review</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{review['fg']};">💬 Escalated for human review</div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -290,16 +620,112 @@ background:rgba(0,0,0,0.03);">
             st.rerun()
 
 
+# ------------------------------------------------------------------
+# First Response DELIVER — the dispatch packet, handed to a HUMAN
+# dispatcher. Never auto-dispatched: that human-in-the-loop step is
+# the deliberate safety story for a life-safety call.
+# ------------------------------------------------------------------
+_SEVERITY_COLOR = {
+    "CRITICAL": "#B71C1C", "HIGH": "#E65100", "LOW": "#0D47A1", "NEEDS_REVIEW": "#5D4037",
+}
+
+
+def _render_deliver_call(decision: Dict[str, Any], call: Dict[str, Any]) -> None:
+    route = decision["route"]
+    style = ROUTE_STYLE.get(route, ROUTE_STYLE["ESCALATE_HUMAN"])
+    packet = (decision.get("action_params", {}) or {}).get("dispatch_packet", {}) or {}
+    severity = packet.get("severity_tier", "NEEDS_REVIEW")
+    sev_color = _SEVERITY_COLOR.get(severity, "#5D4037")
+    ref = _confirmation_number(route, {"name": call.get("caller_name", "")})
+
+    st.markdown("### 📦 Deliver — dispatch packet")
+    status = st.session_state.deliver_status
+
+    packet_rows = f"""
+  <div style="margin-top:0.5rem;"><b>Severity tier:</b>
+    <span style="background:{sev_color};color:#FFF;padding:0.1rem 0.5rem;border-radius:0.4rem;font-weight:800;">{severity}</span></div>
+  <div style="margin-top:0.3rem;"><b>Address:</b> {packet.get('address','—')}</div>
+  <div style="margin-top:0.3rem;"><b>Vulnerability flags:</b> {packet.get('vulnerability_flags','none')}</div>
+  <div style="margin-top:0.3rem;"><b>Responder brief:</b> {packet.get('responder_summary','—')}</div>"""
+
+    if status == "pending":
+        # Triaged and prepared, awaiting the dispatcher's decision.
+        st.markdown(
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px dashed {style['fg']};
+background:rgba(255,255,255,0.05);">
+  <div style="font-size:1.05rem;font-weight:800;color:{style['fg']};">{style['icon']} {style['label']}</div>
+  <div style="margin-top:0.2rem;opacity:0.9;">{decision.get('rationale','')}</div>
+  {packet_rows}
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">🧾 Packet prepared — dispatcher's call</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption("The agent triaged the call and prepared the packet. **Nothing is dispatched until a human dispatcher confirms.**")
+        col_go, col_hold = st.columns(2)
+        if col_go.button("🚑 Dispatch responder", type="primary", use_container_width=True, key="dispatch_action"):
+            st.session_state.deliver_status = "dispatched"
+            st.rerun()
+        if col_hold.button("✋ Hold & review", use_container_width=True, key="hold_action"):
+            st.session_state.deliver_status = "held"
+            st.rerun()
+
+    elif status == "dispatched":
+        st.markdown(
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {style['fg']};
+background:rgba(255,255,255,0.05);">
+  <div style="font-size:1.05rem;font-weight:800;color:{style['fg']};">{style['icon']} {style['label']}</div>
+  {packet_rows}
+  <div style="margin-top:0.3rem;"><b>Dispatch ref #:</b> <code>{ref}</code></div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">✅ Dispatcher confirmed — packet sent to responder</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption("DELIVER is mocked — in production, confirmation pages the on-call responder with this packet.")
+
+    else:  # held → nothing dispatched, dispatcher will review
+        review = ROUTE_STYLE["ESCALATE_HUMAN"]
+        st.markdown(
+            f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {review['fg']};
+background:rgba(255,255,255,0.05);">
+  <div style="font-size:1.05rem;font-weight:800;color:{review['fg']};">{review['icon']} Held for dispatcher review</div>
+  <div style="margin-top:0.4rem;">No responder was dispatched. A dispatcher will review the packet before any action.</div>
+  <div style="margin-top:0.2rem;"><b>Reference #:</b> <code>{ref}</code></div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{review['fg']};">✋ Awaiting human dispatcher</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption("A held call is never dropped — it waits on a human, with nothing dispatched.")
+        if st.button("↩ Reconsider", use_container_width=True, key="reconsider_call_action"):
+            st.session_state.deliver_status = "pending"
+            st.rerun()
+
+
 # ============================================================
 # 7) MAIN LAYOUT
 # ============================================================
-if st.session_state.selected is None:
-    st.info("👈 Pick a customer from the sidebar to detect their bill shock.")
-    st.stop()
+# Branch on the active domain. The DECIDE stage (decision log) is shared; only the
+# record source, DETECT card, DELIVER card, and decide() bindings differ.
+is_call = st.session_state.mode == MODE_CALL
 
-cust = agent.CUSTOMERS[st.session_state.selected]
-
-_render_detect(cust)
+if is_call:
+    # Live-mic source builds a record on the fly; canned source uses the sidebar pick.
+    if st.session_state.get("call_source", SOURCE_CANNED) == SOURCE_LIVE:
+        rec = _capture_live_call()
+        if rec is None:
+            st.stop()  # waiting for a recording + transcript
+    else:
+        if st.session_state.selected is None:
+            st.info("👈 Pick a call from the sidebar — or switch Call source to 🎙️ Live mic.")
+            st.stop()
+        rec = agent.CALLS[st.session_state.selected]
+    _render_detect_call(rec)
+    _render_signal_dashboard(rec)
+else:
+    if st.session_state.selected is None:
+        st.info("👈 Pick a customer from the sidebar to detect their bill shock.")
+        st.stop()
+    rec = agent.CUSTOMERS[st.session_state.selected]
+    _render_detect(rec)
 
 run = st.button("⚡ Run Agent", type="primary", use_container_width=True)
 
@@ -307,10 +733,21 @@ run = st.button("⚡ Run Agent", type="primary", use_container_width=True)
 if run:
     with st.spinner(f"Reasoning… (real Gemini call · {agent.PRIMARY_MODEL})"):
         _t0 = time.time()
-        st.session_state.decision = agent.decide(st.session_state.client, cust)
+        if is_call:
+            st.session_state.decision = agent.decide(
+                st.session_state.client, rec,
+                build_prompt_fn=agent.build_call_prompt,
+                deterministic_fn=agent._deterministic_call_decision,
+                valid_routes=agent.CALL_ROUTES,
+            )
+        else:
+            st.session_state.decision = agent.decide(st.session_state.client, rec)
         st.session_state.decision_latency = round(time.time() - _t0, 2)
     st.session_state.log_done = False            # replay the reveal for this fresh decision
-    st.session_state.deliver_status = "pending"  # new decision → awaiting customer choice
+    st.session_state.deliver_status = "pending"  # new decision → awaiting the human decision
+    # Rerun so the dashboard (rendered above the button) picks up the fresh latency this
+    # cycle instead of one interaction late; the staged reveal still plays post-rerun.
+    st.rerun()
 
 decision = st.session_state.decision
 if decision:
@@ -327,7 +764,10 @@ if decision:
             st.markdown(f"- {step}")
 
     _render_route_badge(decision)
-    _render_deliver(decision, cust)
+    if is_call:
+        _render_deliver_call(decision, rec)
+    else:
+        _render_deliver(decision, rec)
 
 
 # ============================================================
@@ -339,11 +779,15 @@ if any([show_profile, show_prompt, show_routes, show_json, show_meta]):
     st.markdown("### 🧪 Debug / Evidence")
 
 if show_profile:
-    st.markdown("**🗂️ Customer profile — raw mock input (the DETECT source)**")
-    st.json(cust)
+    label = "Call record" if is_call else "Customer profile"
+    st.markdown(f"**🗂️ {label} — raw mock input (the DETECT source)**")
+    st.json(rec)
 
 if show_prompt:
-    _sys_i, _user_c = agent.build_prompt(cust)
+    if is_call:
+        _sys_i, _user_c = agent.build_call_prompt(rec)
+    else:
+        _sys_i, _user_c = agent.build_prompt(rec)
     st.markdown("**📨 Prompt sent to Gemini — the slim payload the model actually saw**")
     st.caption("System instruction")
     st.code(_sys_i, language="text")
@@ -351,8 +795,9 @@ if show_prompt:
     st.code(_user_c, language="text")
 
 if show_routes:
+    _routes = agent.CALL_ROUTES if is_call else agent.ROUTES
     st.markdown("**🛡️ Allowed routes — constrained enum; the model cannot invent a route**")
-    st.code("\n".join(sorted(agent.ROUTES)), language="text")
+    st.code("\n".join(sorted(_routes)), language="text")
 
 if show_json:
     if decision:
