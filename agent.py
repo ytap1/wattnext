@@ -189,17 +189,43 @@ def decide(
 CALL_ROUTES = {"DISPATCH_NOW", "SCHEDULE_TECH", "ESCALATE_HUMAN"}
 
 # Fallback keyword signals (matched against the lowercased transcript).
-# Active-danger => a leak is likely live: emergency responder.
+# The taxonomy is hazard-AGNOSTIC on purpose: WattNext triages any utility
+# emergency, not only gas. Active-danger => a hazard is likely live now.
 ACTIVE_DANGER_KEYWORDS = frozenset({
-    "hiss", "hissing", "evacuat", "rotten egg", "strong smell", "strong odor",
-    "strong odour", "dizzy", "dizziness", "nausea", "nauseous", "headache",
-    "can't breathe", "cant breathe", "trouble breathing", "short of breath",
-    "passed out", "collaps", "unconscious", "lightheaded", "light-headed",
-    "loud", "confirmed leak", "gas everywhere", "filling with gas", "explos",
+    # Gas
+    "hiss", "hissing", "rotten egg", "strong smell", "strong odor", "strong odour",
+    "gas everywhere", "filling with gas", "confirmed leak",
+    # Electrical
+    "spark", "sparks", "sparking", "arcing", "electric shock", "electrocut",
+    "exposed wire", "bare wire", "live wire", "downed line", "downed power line",
+    "power line down", "downed wire",
+    # Fire / thermal (common to gas and electrical)
+    "smoke", "fire", "flame", "burning", "burning smell", "melting", "scorch", "sizzl",
+    # Physical symptoms (hazard-agnostic)
+    "dizzy", "dizziness", "nausea", "nauseous", "headache", "can't breathe",
+    "cant breathe", "trouble breathing", "short of breath", "passed out",
+    "collaps", "unconscious", "lightheaded", "light-headed",
+    # Escalators
+    "evacuat", "explos", "trapped", "loud",
 })
-# Odor-only => a complaint with low signal: non-emergency technician visit.
-ODOR_KEYWORDS = frozenset({
+# Low-signal => an advisory complaint with no active-danger indicators: schedule a tech.
+LOW_SIGNAL_KEYWORDS = frozenset({
+    # Gas
     "smell", "odor", "odour", "faint", "whiff", "gassy", "sulphur", "sulfur",
+    # Electrical
+    "flicker", "flickering", "buzzing", "warm outlet", "warm plug", "tripping",
+    "keeps tripping", "intermittent", "dimming", "crackle", "crackling",
+    # General
+    "slight", "occasional",
+})
+# Ambiguous-hazard => a hazard is NAMED (a leak, gas, a hazard) but with NO active-danger
+# indicator to confirm it and NO way to safely downgrade it to a scheduled visit. The honest
+# outcome is human escalation, not a guess in either direction. This tier exists so the
+# danger-signal dashboard shows WHY an under-specified hazard call escalates, instead of
+# reading as "detector found nothing" on a literal "gas leak".
+AMBIGUOUS_HAZARD_KEYWORDS = frozenset({
+    "gas leak", "leak", "leaking", "smell of gas", "smells like gas", "smell gas",
+    "gas smell", "possible leak", "might be a leak", "think there's a leak",
 })
 
 
@@ -211,14 +237,17 @@ def build_call_prompt(call: dict) -> tuple[str, str]:
     """
     system_instruction = (
         "You are WattNext's first-response triage agent for a utility contact centre. "
-        "You read a raw inbound call transcript about a possible gas odor or leak and "
-        "recommend ONE routing decision for a HUMAN dispatcher. You never dispatch "
-        "anyone yourself. Choose EXACTLY ONE route from this set: "
+        "You read a raw inbound call transcript about a possible utility hazard — a gas "
+        "leak, an electrical hazard (sparks, exposed or downed wires), smoke or burning, "
+        "or similar — and recommend ONE routing decision for a HUMAN dispatcher. You never "
+        "dispatch anyone yourself. Choose EXACTLY ONE route from this set: "
         f"{sorted(CALL_ROUTES)}. "
-        "DISPATCH_NOW = the transcript strongly indicates an active/confirmed leak "
-        "(e.g. smell PLUS hissing, evacuation in progress, or physical symptoms like "
-        "dizziness/nausea/trouble breathing). Send an emergency responder. "
-        "SCHEDULE_TECH = a low-signal odor complaint with NO active-danger indicators. "
+        "DISPATCH_NOW = the transcript strongly indicates an active/confirmed hazard "
+        "(e.g. gas smell PLUS hissing, sparks or exposed/downed wires, smoke or burning, "
+        "evacuation in progress, or physical symptoms like dizziness/nausea/trouble "
+        "breathing). Send an emergency responder. "
+        "SCHEDULE_TECH = a low-signal advisory complaint with NO active-danger indicators "
+        "(e.g. a faint odor, a flickering light, an occasional buzz). "
         "Book a non-emergency technician visit. "
         "ESCALATE_HUMAN = signals are ambiguous, conflicting, or a safety-critical "
         "detail is missing. Route to a human dispatcher to decide. "
@@ -238,7 +267,7 @@ def build_call_prompt(call: dict) -> tuple[str, str]:
     )
     vuln = call.get("account_vulnerability_flag") or "none on file"
     user_content = (
-        "Inbound gas-odor/leak call:\n"
+        "Inbound utility-hazard call:\n"
         f"- Caller: {call.get('caller_name')}\n"
         f"- Address: {call.get('address')}\n"
         f"- Medical-dependent household (from customer record): {call.get('medical_dependent')}\n"
@@ -281,7 +310,8 @@ def _deterministic_call_decision(call: dict) -> dict:
     vuln_flag = call.get("account_vulnerability_flag")
     vulnerable = bool(call.get("medical_dependent")) or bool(vuln_flag)
     has_danger = _mentions(transcript, ACTIVE_DANGER_KEYWORDS)
-    has_odor = _mentions(transcript, ODOR_KEYWORDS)
+    has_ambiguous = _mentions(transcript, AMBIGUOUS_HAZARD_KEYWORDS)
+    has_low_signal = _mentions(transcript, LOW_SIGNAL_KEYWORDS)
 
     vuln_flags = vuln_flag if vuln_flag else ("medical-dependent household" if call.get("medical_dependent") else "none")
 
@@ -294,7 +324,7 @@ def _deterministic_call_decision(call: dict) -> dict:
             "Best route: dispatch an emergency responder now.",
         ]
         rationale = "Active-danger signal in a vulnerable household — dispatch an emergency responder immediately."
-        summary = "Suspected active gas leak; vulnerable occupant — emergency response."
+        summary = "Suspected active hazard; vulnerable occupant — emergency response."
     elif has_danger:
         route, severity = "DISPATCH_NOW", "HIGH"
         steps = [
@@ -304,17 +334,27 @@ def _deterministic_call_decision(call: dict) -> dict:
             "Best route: dispatch an emergency responder now.",
         ]
         rationale = "Active-danger signal in the transcript — dispatch an emergency responder."
-        summary = "Suspected active gas leak — emergency response."
-    elif has_odor:
+        summary = "Suspected active hazard — emergency response."
+    elif has_ambiguous:
+        route, severity = "ESCALATE_HUMAN", "NEEDS_REVIEW"
+        steps = [
+            "Transcript names a hazard (e.g. a gas leak) but gives no confirming detail.",
+            "No active-danger indicator — no hissing, symptoms, or confirmed leak — yet the hazard can't be ruled out.",
+            "Too ambiguous to auto-dispatch, too risky to downgrade to a scheduled visit.",
+            "Best route: escalate to a human dispatcher to decide.",
+        ]
+        rationale = "A hazard is named but under-specified — escalate to a human dispatcher rather than guess."
+        summary = "Named hazard with no confirming detail — needs a human dispatcher to decide."
+    elif has_low_signal:
         route, severity = "SCHEDULE_TECH", "LOW"
         steps = [
-            "Transcript reports an odor but no active-danger indicators.",
-            "No evacuation, hissing, or physical symptoms mentioned.",
+            "Transcript reports a low-signal advisory but no active-danger indicators.",
+            "No evacuation, active-hazard language, or physical symptoms mentioned.",
             "Low-signal complaint suited to a non-emergency visit.",
             "Best route: schedule a technician.",
         ]
-        rationale = "Low-signal odor complaint with no active-danger indicators — schedule a technician."
-        summary = "Odor complaint, no active-danger indicators — non-emergency technician visit."
+        rationale = "Low-signal advisory complaint with no active-danger indicators — schedule a technician."
+        summary = "Low-signal utility complaint, no active-danger indicators — non-emergency technician visit."
     else:
         route, severity = "ESCALATE_HUMAN", "NEEDS_REVIEW"
         steps = [
@@ -366,7 +406,69 @@ CALLS = [
         "medical_dependent": False,
         "account_vulnerability_flag": None,
     },
+    {
+        # Electrical hazard — proves the engine is not gas-only. Routes DISPATCH_NOW.
+        "caller_name": "Marcus Bell",
+        "address": "92 Cedar Avenue",
+        "transcript": (
+            "Caller: There's a downed power line across my driveway after the storm — "
+            "it's sparking and arcing on the wet ground and there's a burning smell. My "
+            "kids are inside and I've kept everyone away from it. Please send someone."
+        ),
+        "medical_dependent": False,
+        "account_vulnerability_flag": None,
+    },
 ]
+
+
+def transcribe_call(client: genai.Client, audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
+    """Transcribe a recorded call with Gemini (multimodal audio -> text).
+
+    A SUPPORTING call, separate from decide(): the mic gives us audio, this turns it
+    into the transcript that decide() then triages. Same primary->fallback model
+    resilience; returns "" on failure so the caller can fall back to a canned/typed
+    transcript instead of hanging the demo.
+    """
+    prompt = (
+        "Transcribe this emergency utility phone call verbatim. "
+        "Return ONLY the spoken words as plain text — no speaker labels, no commentary, no timestamps."
+    )
+    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    config = types.GenerateContentConfig(
+        temperature=0.0,
+        http_options=types.HttpOptions(timeout=10000),
+    )
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+        try:
+            response = client.models.generate_content(
+                model=model, contents=[audio_part, prompt], config=config
+            )
+        except Exception:
+            continue
+        text = (getattr(response, "text", "") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def find_signals(transcript: str) -> dict:
+    """Return the active-danger / low-signal keywords present (negation-aware) in a transcript.
+
+    Powers the live danger-signal dashboard: which words made the agent escalate, and
+    how many. Hazard-agnostic (gas, electrical, fire, symptoms). Uses the same _mentions()
+    logic decide()'s fallback uses, so the on-screen signals match the routing rationale —
+    nothing is highlighted that was negated (e.g. "no hissing" is neither counted nor shown).
+    """
+    t = (transcript or "").lower()
+    danger = sorted({k for k in ACTIVE_DANGER_KEYWORDS if _mentions(t, [k])})
+    low_signal = sorted({k for k in LOW_SIGNAL_KEYWORDS if _mentions(t, [k])})
+    ambiguous = sorted({k for k in AMBIGUOUS_HAZARD_KEYWORDS if _mentions(t, [k])})
+    # Drop ambiguous cues subsumed by a more specific matched cue — e.g. bare "leak"
+    # inside "confirmed leak" (danger) or "gas leak" (ambiguous) — so the ambiguous tier
+    # shows only genuinely under-specified hazards, not redundant fragments.
+    _more_specific = set(danger) | set(ambiguous)
+    ambiguous = [k for k in ambiguous if not any(k != o and k in o for o in _more_specific)]
+    return {"danger": danger, "low_signal": low_signal, "ambiguous": ambiguous}
 
 
 # ------------------------------------------------------------------

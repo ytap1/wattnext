@@ -1,0 +1,10 @@
+# WattNext brand theme — see brand/brand-spec.md §3 Color.
+# Dark base on brand Ink; Electric Blue as the primary accent drives buttons,
+# links, and focus states. Ink background matches the on-dark logo's own bg.
+[theme]
+base = "dark"
+primaryColor = "#2563EB"              # Electric Blue — primary
+backgroundColor = "#0F172A"           # Ink — main surface
+secondaryBackgroundColor = "#1E293B"  # Slate — sidebar / cards
+textColor = "#E2E8F0"                 # Light slate — body text
+font = "sans serif"

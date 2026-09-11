@@ -63,6 +63,9 @@ def _fresh_run_for_maria():
     at.secrets["GEMINI_API_KEY"] = agent._load_api_key() or "ci-dummy-key"
     at.run()
     assert not at.exception, f"app raised on startup: {at.exception}"
+    # First Response is the default (hero) domain now — select Bill Shock explicitly.
+    at.radio(key="mode").set_value("⚡ Bill Shock").run()
+    assert not at.exception, f"mode switch raised: {at.exception}"
     _click(at, "Maria")
     at.run()
     assert "BILL SHOCK DETECTED" in _md(at), "DETECT panel did not render"
