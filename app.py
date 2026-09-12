@@ -98,10 +98,11 @@ with _hero_word:
 # Constant brand line — the flexible engine is the hero; the domain is just what it's pointed at.
 st.markdown("**One flexible agent for the utility contact center — point it at a new problem, it adapts.**")
 if _active_mode == MODE_CALL:
-    st.subheader("First-Response Triage Agent")
+    st.subheader("Live-Call Copilot — First Response")
     st.caption(
-        "One real **Google Gemini** reasoning call — severity tier, routing decision, and a "
-        "dispatch packet. The *same* engine that resolves bill shock, pointed at a hazard call."
+        "A copilot for the contact-center **agent**: it listens as the caller speaks, analyzes "
+        "in the background, and hands the agent a verified-ready decision — severity tier, routing, "
+        "and a dispatch packet. The *same* engine that resolves bill shock, pointed at a hazard call."
     )
 else:
     st.subheader("The Kill Bill Shock Agent")
@@ -161,6 +162,12 @@ ROUTE_STYLE: Dict[str, Dict[str, str]] = {
 # two-branch dry run pushes the 5-min slot (see HACKATHON.md W5).
 STEP_DELAY_SEC = 0.5
 
+# Per-chunk delay for the live-call replay (First Response hero). The transcript
+# reveals a chunk at a time while the danger-signal dashboard re-populates in sync,
+# so the copilot visibly keeps pace with the caller. Trim alongside STEP_DELAY_SEC.
+PLAY_DELAY_SEC = 0.7
+PLAY_MAX_CHUNKS = 5  # cap reveal steps so a long live transcript can't overrun the slot
+
 
 # ============================================================
 # 1) SECRETS + CLIENT (once per session)
@@ -197,6 +204,7 @@ if "client" not in st.session_state:
 for _key, _default in [
     ("selected", None),      # index into agent.CUSTOMERS/CALLS, or None
     ("decision", None),      # last decision dict, or None
+    ("call_played", False),         # whether the live-call replay has run for this record
     ("log_done", False),            # whether the staged reveal has already played
     ("deliver_status", "pending"),  # pending | accepted | declined
     ("decision_latency", None),     # seconds the live DECIDE call took
@@ -210,6 +218,7 @@ for _key, _default in [
 def _clear_decision() -> None:
     """Reset just the DECIDE/DELIVER state (a fresh record → replay the loop)."""
     st.session_state.decision = None
+    st.session_state.call_played = False
     st.session_state.log_done = False
     st.session_state.deliver_status = "pending"
 
@@ -325,7 +334,7 @@ def _render_detect_call(call: Dict[str, Any]) -> None:
 color:#FFFFFF;margin-bottom:0.5rem;">
   <div style="font-size:1.15rem;font-weight:800;">📞 INCOMING HAZARD CALL — {call.get('caller_name')}</div>
   <div style="font-size:1.05rem;font-weight:700;margin:0.15rem 0;">📍 {call.get('address')}</div>
-  <div style="margin-top:0.35rem;font-weight:500;opacity:0.95;">Awaiting triage — nothing dispatched until a human dispatcher confirms.</div>
+  <div style="margin-top:0.35rem;font-weight:500;opacity:0.95;">Awaiting triage — nothing dispatched until a human agent confirms.</div>
 </div>""",
         unsafe_allow_html=True,
     )
@@ -656,11 +665,11 @@ background:rgba(255,255,255,0.05);">
   <div style="font-size:1.05rem;font-weight:800;color:{style['fg']};">{style['icon']} {style['label']}</div>
   <div style="margin-top:0.2rem;opacity:0.9;">{decision.get('rationale','')}</div>
   {packet_rows}
-  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">🧾 Packet prepared — dispatcher's call</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">🧾 Packet prepared — agent's call</div>
 </div>""",
             unsafe_allow_html=True,
         )
-        st.caption("The agent triaged the call and prepared the packet. **Nothing is dispatched until a human dispatcher confirms.**")
+        st.caption("The copilot triaged the call and prepared the packet. **Nothing is dispatched until the human agent confirms.**")
         col_go, col_hold = st.columns(2)
         if col_go.button("🚑 Dispatch responder", type="primary", use_container_width=True, key="dispatch_action"):
             st.session_state.deliver_status = "dispatched"
@@ -676,7 +685,7 @@ background:rgba(255,255,255,0.05);">
   <div style="font-size:1.05rem;font-weight:800;color:{style['fg']};">{style['icon']} {style['label']}</div>
   {packet_rows}
   <div style="margin-top:0.3rem;"><b>Dispatch ref #:</b> <code>{ref}</code></div>
-  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">✅ Dispatcher confirmed — packet sent to responder</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">✅ Agent confirmed — packet sent to responder</div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -687,10 +696,10 @@ background:rgba(255,255,255,0.05);">
         st.markdown(
             f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {review['fg']};
 background:rgba(255,255,255,0.05);">
-  <div style="font-size:1.05rem;font-weight:800;color:{review['fg']};">{review['icon']} Held for dispatcher review</div>
-  <div style="margin-top:0.4rem;">No responder was dispatched. A dispatcher will review the packet before any action.</div>
+  <div style="font-size:1.05rem;font-weight:800;color:{review['fg']};">{review['icon']} Held for agent review</div>
+  <div style="margin-top:0.4rem;">No responder was dispatched. The agent will review the packet before any action.</div>
   <div style="margin-top:0.2rem;"><b>Reference #:</b> <code>{ref}</code></div>
-  <div style="margin-top:0.55rem;font-weight:800;color:{review['fg']};">✋ Awaiting human dispatcher</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{review['fg']};">✋ Awaiting human agent</div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -701,37 +710,48 @@ background:rgba(255,255,255,0.05);">
 
 
 # ============================================================
-# 7) MAIN LAYOUT
+# 6b) LIVE-CALL REPLAY
+#     The hero interaction: one "▶ Play call" click reveals the transcript a
+#     chunk at a time while the danger-signal dashboard populates in sync, so the
+#     copilot is SEEN keeping pace with the caller — then the one real decision lands.
 # ============================================================
-# Branch on the active domain. The DECIDE stage (decision log) is shared; only the
-# record source, DETECT card, DELIVER card, and decide() bindings differ.
-is_call = st.session_state.mode == MODE_CALL
+def _split_sentences(text: str) -> list:
+    """Split a transcript into sentence-ish chunks for progressive reveal."""
+    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+    return [p for p in parts if p]
 
-if is_call:
-    # Live-mic source builds a record on the fly; canned source uses the sidebar pick.
-    if st.session_state.get("call_source", SOURCE_CANNED) == SOURCE_LIVE:
-        rec = _capture_live_call()
-        if rec is None:
-            st.stop()  # waiting for a recording + transcript
-    else:
-        if st.session_state.selected is None:
-            st.info("👈 Pick a call from the sidebar — or switch Call source to 🎙️ Live mic.")
-            st.stop()
-        rec = agent.CALLS[st.session_state.selected]
-    _render_detect_call(rec)
-    _render_signal_dashboard(rec)
-else:
-    if st.session_state.selected is None:
-        st.info("👈 Pick a customer from the sidebar to detect their bill shock.")
-        st.stop()
-    rec = agent.CUSTOMERS[st.session_state.selected]
-    _render_detect(rec)
 
-run = st.button("⚡ Run Agent", type="primary", use_container_width=True)
+def _play_chunks(text: str, max_chunks: int = PLAY_MAX_CHUNKS) -> list:
+    """Sentences for reveal, merged into at most `max_chunks` groups so a long
+    (e.g. live-mic) transcript can't overrun the demo slot."""
+    sents = _split_sentences(text)
+    if len(sents) <= max_chunks:
+        return sents
+    size = -(-len(sents) // max_chunks)  # ceil division
+    return [" ".join(sents[i:i + size]) for i in range(0, len(sents), size)]
 
-# Trigger the DECIDE call on click; persist the result across reruns.
-if run:
-    with st.spinner(f"Reasoning… (real Gemini call · {agent.PRIMARY_MODEL})"):
+
+def _play_call(call: Dict[str, Any]) -> None:
+    """Reveal the transcript chunk-by-chunk, re-rendering the danger-signal
+    dashboard on the accumulated text each step (decision is still None here, so
+    the dashboard shows its preview severity). Blocking — plays during the click
+    run, exactly like the decision-log staged reveal already does."""
+    chunks = _play_chunks(call.get("transcript") or "")
+    if not chunks:
+        return
+    ph = st.empty()
+    acc = ""
+    for i, chunk in enumerate(chunks, start=1):
+        acc = f"{acc} {chunk}".strip()
+        with ph.container():
+            st.caption(f"🔴 Live call in progress — copilot analyzing… ({i}/{len(chunks)})")
+            _render_signal_dashboard({**call, "transcript": acc})
+        time.sleep(PLAY_DELAY_SEC)
+
+
+def _run_decision(rec: Dict[str, Any], is_call: bool) -> None:
+    """Fire the ONE real Gemini decision call and record its latency."""
+    with st.spinner(f"Copilot reasoning… (real Gemini call · {agent.PRIMARY_MODEL})"):
         _t0 = time.time()
         if is_call:
             st.session_state.decision = agent.decide(
@@ -743,11 +763,60 @@ if run:
         else:
             st.session_state.decision = agent.decide(st.session_state.client, rec)
         st.session_state.decision_latency = round(time.time() - _t0, 2)
-    st.session_state.log_done = False            # replay the reveal for this fresh decision
-    st.session_state.deliver_status = "pending"  # new decision → awaiting the human decision
-    # Rerun so the dashboard (rendered above the button) picks up the fresh latency this
-    # cycle instead of one interaction late; the staged reveal still plays post-rerun.
-    st.rerun()
+
+
+# ============================================================
+# 7) MAIN LAYOUT
+# ============================================================
+# Branch on the active domain. The DECIDE stage (decision log) is shared; only the
+# record source, DETECT card, DELIVER card, and decide() bindings differ.
+is_call = st.session_state.mode == MODE_CALL
+
+if is_call:
+    # Live-mic source builds a record on the fly; canned source uses the sidebar pick.
+    is_live = st.session_state.get("call_source", SOURCE_CANNED) == SOURCE_LIVE
+    if is_live:
+        rec = _capture_live_call()
+        if rec is None:
+            st.stop()  # waiting for a recording + transcript
+    else:
+        if st.session_state.selected is None:
+            st.info("👈 Pick a call from the sidebar — or switch Call source to 🎙️ Live mic.")
+            st.stop()
+        rec = agent.CALLS[st.session_state.selected]
+    _render_detect_call(rec)
+
+    # HERO reveal. Canned calls wait for a "▶ Play call" click (a scripted, on-cue
+    # demo moment). The live-mic path AUTO-RUNS the instant the recording stops —
+    # the browser only hands us the audio on stop, so this is the honest "the call
+    # ends, the copilot already has the answer" moment, no separate click. Both paths
+    # then share the same replay + one-real-decision code below.
+    if not st.session_state.call_played:
+        if not is_live:
+            st.caption("▶ Press play — the copilot analyzes the call as the caller speaks.")
+            if not st.button("▶ Play call", type="primary", use_container_width=True):
+                st.stop()  # canned: wait for the on-cue click
+        _play_call(rec)                   # progressive transcript + signal dashboard
+        _run_decision(rec, is_call=True)  # the ONE real Gemini call (free-tier model)
+        st.session_state.call_played = True
+        st.session_state.log_done = False            # decision log reveals post-rerun
+        st.session_state.deliver_status = "pending"  # awaiting the agent's verify
+        st.rerun()
+    # Settled: full dashboard (shows the DECIDED severity + real time-to-triage).
+    _render_signal_dashboard(rec)
+else:
+    if st.session_state.selected is None:
+        st.info("👈 Pick a customer from the sidebar to detect their bill shock.")
+        st.stop()
+    rec = agent.CUSTOMERS[st.session_state.selected]
+    _render_detect(rec)
+
+    # Bill Shock (scalability retarget) keeps the one-click Run Agent trigger.
+    if st.button("⚡ Run Agent", type="primary", use_container_width=True):
+        _run_decision(rec, is_call=False)
+        st.session_state.log_done = False            # replay the reveal for this fresh decision
+        st.session_state.deliver_status = "pending"  # new decision → awaiting the human decision
+        st.rerun()
 
 decision = st.session_state.decision
 if decision:

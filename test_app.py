@@ -105,6 +105,36 @@ def test_deliver_flow():
     assert "WN-" in md
 
 
+def test_call_play_flow():
+    """First Response hero: '▶ Play call' drives the replay + the one decision, and
+    the deliver (dispatch/hold) controls appear. Offline-safe: with no key, decide()
+    falls back deterministically and the flow still completes."""
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.secrets["GEMINI_API_KEY"] = agent._load_api_key() or "ci-dummy-key"
+    at.run()
+    assert not at.exception, f"app raised on startup: {at.exception}"
+    # First Response is the default (hero) domain; pick canned Call A (Rosa).
+    _click(at, "Rosa")
+    at.run()
+    assert "INCOMING HAZARD CALL" in _md(at), "hazard DETECT panel did not render"
+    assert at.session_state["call_played"] is False, "call marked played before ▶ Play"
+
+    # Play the call → progressive replay + the ONE real decision call.
+    _click(at, "Play call")
+    at.run()
+    assert at.session_state["call_played"] is True, "▶ Play did not mark the call played"
+    assert at.session_state["decision"] is not None, "no decision after ▶ Play"
+    md = _md(at)
+    assert "Decision Log" in md, "decision log did not render"
+
+    labels = [b.label for b in at.button]
+    assert any("Dispatch responder" in (l or "") for l in labels), labels
+    assert any("Hold" in (l or "") for l in labels), labels
+
+    lat = at.session_state["decision_latency"]
+    assert isinstance(lat, (int, float)) and lat > 0, f"latency not captured: {lat}"
+
+
 def test_debug_views():
     """All five Debug/Evidence panels render; latency is captured."""
     at = _fresh_run_for_maria()
@@ -146,7 +176,7 @@ def test_live_decision():
 if __name__ == "__main__":
     import sys
 
-    tests = [test_deliver_flow, test_debug_views, test_live_decision]
+    tests = [test_deliver_flow, test_call_play_flow, test_debug_views, test_live_decision]
     passed = failures = skipped = 0
     for t in tests:
         try:
