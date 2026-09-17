@@ -172,11 +172,121 @@ def test_live_decision():
     assert len(set(routes.values())) == 2, f"routes did not diverge: {routes}"
 
 
+# ---- cross-incident intelligence (deterministic, offline-safe) -------------
+def test_normalize_street_matches_variants():
+    """The Rosa/seed Maple variants collapse to one key; other mains stay distinct."""
+    ns = agent.normalize_street
+    assert ns("418 Maple Street, Apt 2B") == "maple st"
+    assert ns("402 Maple Street") == "maple st"
+    assert ns("431 Maple Street, Apt 5C") == "maple st"
+    assert ns("77 Birchwood Lane") == "birchwood ln"
+    assert ns("92 Cedar Avenue") == "cedar ave"
+    assert ns("birchwood ln") != ns("cedar ave")
+    assert ns("") == ""
+
+
+def test_cluster_fires_for_rosa():
+    """Rosa's Maple St call is the 3rd report on the main → systemic cluster + value."""
+    c = agent.detect_cluster(agent.CALLS[0])
+    assert c["clustered"] and c["systemic_event"], "Rosa should trigger a systemic cluster"
+    assert c["prior_count"] >= agent.CLUSTER_MIN_PRIOR
+    assert c["total_reports"] >= 3
+    assert c["dominant_hazard"] == "gas"
+    assert len(c["vulnerable_neighbors"]) >= 1, "should flag the oxygen-dependent neighbor"
+    val = c["value"]
+    assert val.get("trucks_saved", 0) >= 1
+    assert val.get("dollars_saved", 0) > 0
+    assert val.get("exposure_minutes_avoided", 0) > 0
+
+
+def test_incident_street_keys_match_normalizer():
+    """The plan's #1 stage risk is a normalize_street mismatch silently killing the
+    cluster. Guard it: every seed's explicit street_key must equal what normalize_street
+    would produce for its address, so a future data edit can't desync them undetected."""
+    for inc in agent.INCIDENTS:
+        assert inc["street_key"] == agent.normalize_street(inc["address"]), (
+            f"{inc['id']}: street_key {inc['street_key']!r} != "
+            f"normalize_street({inc['address']!r})={agent.normalize_street(inc['address'])!r}"
+        )
+
+
+def test_cluster_does_not_fire_for_trevor():
+    """Trevor's Birchwood call has only 1 prior report → below threshold, no cluster."""
+    c = agent.detect_cluster(agent.CALLS[1])
+    assert not c["clustered"], "Trevor should NOT cluster (no false positive)"
+    assert c["prior_count"] < agent.CLUSTER_MIN_PRIOR
+    assert c["value"] == {}
+
+
+def test_cluster_does_not_fire_for_marcus():
+    """Marcus's Cedar call has only 1 prior report → below threshold, no cluster."""
+    c = agent.detect_cluster(agent.CALLS[2])
+    assert not c["clustered"], "Marcus should NOT cluster (no false positive)"
+    assert c["prior_count"] < agent.CLUSTER_MIN_PRIOR
+
+
+def test_cluster_prompt_injection_safe():
+    """Injection is additive: it extends the prompt when clustered, leaves the default
+    prompt byte-for-byte unchanged, and never perturbs the deterministic route."""
+    rosa = agent.CALLS[0]
+    cluster = agent.detect_cluster(rosa)
+    assert cluster["clustered"]
+    sys_i, user_c = agent.build_call_prompt(rosa, cluster=cluster)
+    assert "CROSS-INCIDENT" in user_c and "SYSTEMIC" in user_c
+    base_sys, base_user = agent.build_call_prompt(rosa)  # no cluster kwarg
+    assert "CROSS-INCIDENT" not in base_user, "default prompt must not carry cluster context"
+    result = agent.build_call_prompt(rosa)
+    assert isinstance(result, tuple) and len(result) == 2, "signature must stay a 2-tuple"
+    assert agent._deterministic_call_decision(rosa)["route"] == "DISPATCH_NOW", (
+        "deterministic route must ignore cluster context"
+    )
+
+
+def test_cluster_panel_renders_offline():
+    """The intelligence panel renders in the full Rosa flow, live OR on the fallback."""
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.secrets["GEMINI_API_KEY"] = agent._load_api_key() or "ci-dummy-key"
+    at.run()
+    assert not at.exception, f"app raised on startup: {at.exception}"
+    _click(at, "Rosa")
+    at.run()
+    _click(at, "Play call")
+    at.run()
+    assert not at.exception, f"cluster render raised: {at.exception}"
+    md = _md(at)
+    assert "SYSTEMIC" in md, "systemic-event banner missing"
+    assert "Maple" in md, "street label missing"
+    assert "Proactive outreach" in md, "vulnerable-household outreach callout missing"
+
+
+def test_cluster_isolated_panel_renders_for_trevor():
+    """The isolated-incident panel branch renders end-to-end without a false cluster."""
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.secrets["GEMINI_API_KEY"] = agent._load_api_key() or "ci-dummy-key"
+    at.run()
+    assert not at.exception, f"app raised on startup: {at.exception}"
+    _click(at, "Trevor")
+    at.run()
+    _click(at, "Play call")
+    at.run()
+    assert not at.exception, f"isolated-panel render raised: {at.exception}"
+    md = _md(at)
+    assert "No systemic pattern" in md, "isolated-incident panel missing"
+    assert "SYSTEMIC" not in md, "false systemic cluster shown for Trevor"
+
+
 # ---- plain-python runner (no pytest needed) --------------------------------
 if __name__ == "__main__":
     import sys
 
-    tests = [test_deliver_flow, test_call_play_flow, test_debug_views, test_live_decision]
+    tests = [
+        test_deliver_flow, test_call_play_flow, test_debug_views,
+        test_normalize_street_matches_variants, test_incident_street_keys_match_normalizer,
+        test_cluster_fires_for_rosa, test_cluster_does_not_fire_for_trevor,
+        test_cluster_does_not_fire_for_marcus, test_cluster_prompt_injection_safe,
+        test_cluster_panel_renders_offline, test_cluster_isolated_panel_renders_for_trevor,
+        test_live_decision,
+    ]
     passed = failures = skipped = 0
     for t in tests:
         try:

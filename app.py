@@ -19,6 +19,7 @@ import hashlib
 import html
 import re
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterator, Sequence
 
@@ -168,6 +169,13 @@ STEP_DELAY_SEC = 0.5
 PLAY_DELAY_SEC = 0.7
 PLAY_MAX_CHUNKS = 5  # cap reveal steps so a long live transcript can't overrun the slot
 
+# Kill-switch for cross-incident prompt injection. When True, a detected systemic
+# cluster is threaded into the single real decision's prompt so its reasoning can cite
+# the pattern. Flip to False to ship the intelligence PANEL untouched while leaving the
+# live prompt exactly as-is — a safety valve if the model misbehaves off-stage. The
+# panel itself is deterministic and never depends on this flag.
+CLUSTER_PROMPT_INJECTION = True
+
 
 # ============================================================
 # 1) SECRETS + CLIENT (once per session)
@@ -210,6 +218,7 @@ for _key, _default in [
     ("decision_latency", None),     # seconds the live DECIDE call took
     ("live_transcript", ""),        # Gemini transcription of the recorded call
     ("live_audio_sig", None),       # hash of the last transcribed audio (avoid re-calling)
+    ("cluster", None),              # cross-incident cluster dict for the active call, or None
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -221,6 +230,7 @@ def _clear_decision() -> None:
     st.session_state.call_played = False
     st.session_state.log_done = False
     st.session_state.deliver_status = "pending"
+    st.session_state.cluster = None
 
 
 def _select_customer(idx: int) -> None:
@@ -452,6 +462,120 @@ background:rgba(255,255,255,0.05);line-height:1.7;">{_highlight(transcript, dang
             "A hazard is named but unconfirmed — no active-danger signal to dispatch on, "
             "yet too risky to downgrade. The agent escalates to a human rather than guess."
         )
+
+
+def _render_incident_intelligence(call: Dict[str, Any], cluster: "Dict[str, Any] | None") -> None:
+    """Cross-incident intelligence panel — the WattNext differentiator.
+
+    Correlates this call against recent reports on the same main and, when a systemic
+    pattern emerges, flags a probable main event + vulnerable households for proactive
+    outreach, with a quantified value strip. Reads detect_cluster() output ONLY (never
+    model output), so it renders identically live or on the deterministic fallback.
+    """
+    if not cluster:
+        return
+    st.markdown("### 🛰️ Cross-incident intelligence")
+
+    if not cluster.get("clustered"):
+        prior = cluster.get("prior_count", 0)
+        label = cluster.get("street_label", "this area")
+        hours = max(cluster.get("window_min", 120) // 60, 1)
+        rpt = f"{prior} prior report{'s' if prior != 1 else ''}"
+        st.markdown(
+            f"""<div style="padding:0.9rem 1.1rem;border-radius:0.6rem;background:#111C31;
+border:1px solid #334155;border-left:4px solid #22D3EE;color:#E2E8F0;">
+  <div style="font-weight:800;color:#38BDF8;">🛰️ No systemic pattern — isolated incident</div>
+  <div style="margin-top:0.3rem;font-size:0.92rem;color:#94A3B8;">
+    {rpt} on {html.escape(label)} in the last {hours}h — below the cluster threshold.
+    Handled as a single call. <b>No false alarm raised.</b>
+  </div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption("Proof it doesn't cry wolf: one main, one report, no manufactured pattern.")
+        return
+
+    # --- Clustered: a probable systemic event ---
+    label = cluster.get("street_label", "this area")
+    hazard = cluster.get("dominant_hazard", "utility")
+    val = cluster.get("value", {}) or {}
+    st.markdown(
+        f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;
+background:linear-gradient(90deg,#B71C1C 0%,#CA8A04 100%);color:#FFFFFF;margin-bottom:0.5rem;">
+  <div style="font-size:1.15rem;font-weight:800;">⚠️ PROBABLE SYSTEMIC EVENT</div>
+  <div style="font-size:1rem;font-weight:700;margin-top:0.15rem;">
+    Possible {html.escape(hazard)}-main event on {html.escape(label)} — not an isolated leak
+  </div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Reports on this main", cluster.get("total_reports", 0))
+    m2.metric("Within", f"{cluster.get('first_report_min_ago', 0)} min")
+    m3.metric("Vulnerable households", len(cluster.get("vulnerable_neighbors", [])))
+    m4.metric("Detected earlier", f"~{val.get('detection_lead_min', 0)} min")
+
+    st.markdown("**📍 Correlated reports on this main**")
+    rows = []
+    for inc in cluster.get("matched_incidents", []):
+        vflag = inc.get("vulnerability_flag")
+        chip = (
+            f' <span style="background:#CA8A04;color:#fff;padding:1px 7px;border-radius:10px;'
+            f'font-size:0.72rem;font-weight:700;">{html.escape(vflag)}</span>' if vflag else ""
+        )
+        status = html.escape(str(inc.get("status", "")).replace("_", " "))
+        rows.append(
+            f"""<div style="padding:0.4rem 0.7rem;border-left:3px solid #B71C1C;margin:0.25rem 0;
+background:rgba(255,255,255,0.04);border-radius:0.35rem;">
+  <b>{html.escape(inc.get('id',''))}</b> · {html.escape(inc.get('address',''))}
+  · {inc.get('minutes_ago','?')} min ago · <i>{status}</i>{chip}
+  <div style="font-size:0.82rem;color:#94A3B8;margin-top:0.1rem;">{html.escape(inc.get('summary',''))}</div>
+</div>"""
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True)
+
+    # Proactive vulnerable-household outreach — the life-safety differentiator.
+    vuln = cluster.get("vulnerable_neighbors", [])
+    if vuln:
+        names = "; ".join(
+            f"{html.escape(v.get('address',''))} "
+            f"({html.escape(v.get('vulnerability_flag') or 'vulnerable')})"
+            for v in vuln
+        )
+        st.markdown(
+            f"""<div style="padding:0.85rem 1.1rem;border-radius:0.6rem;background:#3B2A00;
+border:1px solid #CA8A04;border-left:4px solid #FACC15;color:#FDE68A;margin-top:0.4rem;">
+  <div style="font-weight:800;">📞 Proactive outreach — vulnerable household on this main</div>
+  <div style="margin-top:0.25rem;color:#FEF3C7;">{names}</div>
+  <div style="font-size:0.82rem;color:#D6B08C;margin-top:0.2rem;">
+    Flagged for a wellness call <b>before they dial in</b> — the platform knows they're on the affected main.
+  </div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+
+    # Quantified value strip — emergency framing, conservative + labeled.
+    st.markdown(
+        f"""<div style="margin-top:0.5rem;padding:0.8rem 1rem;border-radius:0.6rem;
+background:#052E2B;border:1px solid #0D9488;border-left:4px solid #22D3EE;">
+  <div style="font-weight:800;color:#5EEAD4;">💡 Value of catching it early</div>
+  <div style="display:flex;flex-wrap:wrap;gap:1.4rem;margin-top:0.4rem;color:#E2E8F0;">
+    <div><b style="color:#22D3EE;font-size:1.25rem;">{val.get('exposure_minutes_avoided',0)}</b><br>
+      <span style="font-size:0.8rem;color:#94A3B8;">exposure-minutes acted on sooner</span></div>
+    <div><b style="color:#22D3EE;font-size:1.25rem;">{val.get('trucks_without',0)} &rarr; {val.get('trucks_with',0)}</b><br>
+      <span style="font-size:0.8rem;color:#94A3B8;">emergency truck-rolls (consolidated)</span></div>
+    <div><b style="color:#22D3EE;font-size:1.25rem;">${val.get('dollars_saved',0):,}</b><br>
+      <span style="font-size:0.8rem;color:#94A3B8;">avoidable dispatch cost, this event</span></div>
+  </div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Cross-incident intelligence — deterministic, no extra AI call. No single call "
+        "transcript reveals this. The dollar figure prices only avoidable dispatches; the "
+        "safety benefit is shown as exposure-minutes and the flagged household — deliberately not dollarized."
+    )
 
 
 def _capture_live_call() -> "Dict[str, Any] | None":
@@ -754,9 +878,19 @@ def _run_decision(rec: Dict[str, Any], is_call: bool) -> None:
     with st.spinner(f"Copilot reasoning… (real Gemini call · {agent.PRIMARY_MODEL})"):
         _t0 = time.time()
         if is_call:
+            # Cross-incident cluster — deterministic, NO extra model call. Optionally
+            # thread a clustered summary into THIS one call's prompt via functools.partial
+            # so the reasoning can cite the systemic pattern; decide() stays untouched.
+            cluster = agent.detect_cluster(rec)
+            st.session_state.cluster = cluster
+            build_fn = (
+                partial(agent.build_call_prompt, cluster=cluster)
+                if (CLUSTER_PROMPT_INJECTION and cluster.get("clustered"))
+                else agent.build_call_prompt
+            )
             st.session_state.decision = agent.decide(
                 st.session_state.client, rec,
-                build_prompt_fn=agent.build_call_prompt,
+                build_prompt_fn=build_fn,
                 deterministic_fn=agent._deterministic_call_decision,
                 valid_routes=agent.CALL_ROUTES,
             )
@@ -804,6 +938,9 @@ if is_call:
         st.rerun()
     # Settled: full dashboard (shows the DECIDED severity + real time-to-triage).
     _render_signal_dashboard(rec)
+    # Cross-incident intelligence — the systemic pattern recognized BEFORE the decision
+    # log, so the narrative reads: signals -> pattern -> agent decides -> dispatch.
+    _render_incident_intelligence(rec, st.session_state.cluster)
 else:
     if st.session_state.selected is None:
         st.info("👈 Pick a customer from the sidebar to detect their bill shock.")
@@ -854,7 +991,13 @@ if show_profile:
 
 if show_prompt:
     if is_call:
-        _sys_i, _user_c = agent.build_call_prompt(rec)
+        # Show the ACTUAL prompt sent — including injected cross-incident context when a
+        # cluster fired and injection is on, so judges see the intelligence reach the model.
+        _clu = st.session_state.cluster
+        if CLUSTER_PROMPT_INJECTION and _clu and _clu.get("clustered"):
+            _sys_i, _user_c = agent.build_call_prompt(rec, cluster=_clu)
+        else:
+            _sys_i, _user_c = agent.build_call_prompt(rec)
     else:
         _sys_i, _user_c = agent.build_prompt(rec)
     st.markdown("**📨 Prompt sent to Gemini — the slim payload the model actually saw**")

@@ -229,11 +229,18 @@ AMBIGUOUS_HAZARD_KEYWORDS = frozenset({
 })
 
 
-def build_call_prompt(call: dict) -> tuple[str, str]:
+def build_call_prompt(call: dict, cluster: dict | None = None) -> tuple[str, str]:
     """Return (system_instruction, user_content) for a first-response DECIDE call.
 
     Same JSON schema as build_prompt so _parse_decision handles both; only the
     domain, route set, and the safety bias differ.
+
+    cluster is an OPTIONAL cross-incident context dict from detect_cluster(). When
+    present and clustered, a short platform-detected summary is appended to the
+    prompt so the ONE real decision can reference the systemic pattern. This is
+    purely additive — cluster=None reproduces the original prompt byte-for-byte,
+    it adds no model call, and it only extends the input (never the output schema),
+    so _parse_decision is unaffected.
     """
     system_instruction = (
         "You are WattNext's first-response triage agent for a utility contact centre. "
@@ -275,6 +282,17 @@ def build_call_prompt(call: dict) -> tuple[str, str]:
         "- Raw call transcript:\n"
         f"\"\"\"\n{call.get('transcript')}\n\"\"\"\n"
     )
+    if cluster and cluster.get("clustered"):
+        user_content += (
+            "\nCROSS-INCIDENT CONTEXT (platform-detected across recent calls, "
+            "deterministic — NOT stated in this call's transcript):\n"
+            f"- {cluster.get('summary', '')}\n"
+        )
+        system_instruction += (
+            " If a CROSS-INCIDENT CONTEXT section is present indicating a probable "
+            "systemic event, you MAY reference it in your reasoning steps; it does NOT "
+            "change the route enum or the required JSON schema."
+        )
     return system_instruction, user_content
 
 
@@ -478,6 +496,181 @@ def find_signals(transcript: str) -> dict:
     return {"danger": danger, "low_signal": low_signal, "ambiguous": ambiguous}
 
 
+# ==================================================================
+# CROSS-INCIDENT INTELLIGENCE — emerging-incident cluster detection.
+# Pure, deterministic Python (NO model call): correlates the current hazard call
+# against other recent reports on the same street/main. When >= CLUSTER_MIN_PRIOR
+# prior reports cluster on one main inside the window, WattNext flags a probable
+# SYSTEMIC event (a gas-main rupture, not isolated leaks) and surfaces vulnerable
+# households on that main for proactive outreach. This is the differentiator no
+# transcription tool can produce: no single call reveals it.
+# Offline/demo-safe: the panel reads THIS (never model output), so it renders
+# identically live or on the deterministic fallback.
+# ==================================================================
+
+CLUSTER_WINDOW_MIN = 120          # 2-hour correlation window
+CLUSTER_MIN_PRIOR = 2             # >= 2 prior reports on the main (this call = 3rd) tips a cluster
+MANUAL_CORRELATION_LAG_MIN = 30   # ASSUMPTION: a supervisor spots the cross-call pattern ~30 min later than the platform
+EMERGENCY_TRUCK_ROLL_USD = 1200   # ASSUMPTION: loaded cost of one emergency field dispatch (crew + vehicle + OT)
+
+# Recent utility-hazard reports the contact centre has already logged — mock data,
+# inline like CALLS/CUSTOMERS. Each row is one prior call. `street_key` is the
+# normalized main, stored explicitly as a HEDGE so a normalize_street() regression
+# can't silently kill the cluster on stage (matching falls back to it). `minutes_ago`
+# is relative (not wall-clock) so detection is deterministic and offline-reproducible.
+INCIDENTS = [
+    # Maple Street seeds — Rosa (CALLS[0]) becomes the 3rd report -> cluster fires.
+    {"id": "INC-4021", "address": "402 Maple Street", "street_key": "maple st",
+     "hazard_type": "gas", "minutes_ago": 47, "status": "unresolved",
+     "medical_dependent": False, "vulnerability_flag": None,
+     "summary": "Strong gas odor + hissing near the street-side meter."},
+    {"id": "INC-4024", "address": "431 Maple Street, Apt 5C", "street_key": "maple st",
+     "hazard_type": "gas", "minutes_ago": 22, "status": "crew_enroute",
+     "medical_dependent": True, "vulnerability_flag": "elderly, oxygen-dependent",
+     "summary": "Gas smell in stairwell; oxygen-dependent resident in unit."},
+    # Distractors on OTHER mains — prove NO false cluster for Trevor / Marcus.
+    {"id": "INC-3987", "address": "15 Birchwood Lane", "street_key": "birchwood ln",
+     "hazard_type": "gas", "minutes_ago": 33, "status": "resolved",
+     "medical_dependent": False, "vulnerability_flag": None,
+     "summary": "Single faint-odor report; crew found nothing, resolved."},
+    {"id": "INC-3921", "address": "88 Cedar Avenue", "street_key": "cedar ave",
+     "hazard_type": "electrical", "minutes_ago": 15, "status": "unresolved",
+     "medical_dependent": False, "vulnerability_flag": None,
+     "summary": "Downed-line report after the storm; isolated to one pole."},
+]
+
+# Street-type suffixes canonicalized so spelling variants collide (Street/St -> st).
+_STREET_SUFFIXES = {
+    "street": "st", "st": "st", "avenue": "ave", "ave": "ave", "av": "ave",
+    "lane": "ln", "ln": "ln", "road": "rd", "rd": "rd", "boulevard": "blvd",
+    "blvd": "blvd", "drive": "dr", "dr": "dr", "court": "ct", "ct": "ct",
+    "place": "pl", "pl": "pl", "way": "way",
+}
+
+# A leading house number or hyphenated range: "418", "12B", "1200-1210".
+_HOUSE_NUM_RE = re.compile(r"\d+[a-z]?(-\d+[a-z]?)?$")
+
+
+def normalize_street(address: str) -> str:
+    """Reduce a free-text address to a canonical street key.
+
+    "418 Maple Street, Apt 2B" -> "maple st". Drops the unit (everything after the
+    first comma), the leading house number/range, and canonicalizes the street-type
+    suffix so spelling variants collide. Returns "" for an empty address.
+    Known limitation (out of demo scope): directional prefixes like "N Maple" are
+    not stripped, so "N Maple St" and "Maple St" would not collide.
+    """
+    if not address:
+        return ""
+    head = address.split(",")[0].strip().lower()      # drop ", Apt 2B"
+    head = re.sub(r"[^a-z0-9\s]", " ", head)           # punctuation -> space
+    tokens = head.split()
+    while tokens and _HOUSE_NUM_RE.fullmatch(tokens[0]):
+        tokens.pop(0)                                  # drop house number / range
+    if tokens and tokens[-1] in _STREET_SUFFIXES:
+        tokens[-1] = _STREET_SUFFIXES[tokens[-1]]      # canonicalize suffix
+    return " ".join(tokens).strip()
+
+
+def _street_label(address: str) -> str:
+    """Human-readable street name for banners: "418 Maple Street, Apt 2B" ->
+    "Maple Street". Drops a leading house number; falls back to the raw head."""
+    if not address:
+        return "this area"
+    head = address.split(",")[0].strip()
+    tokens = head.split()
+    while tokens and _HOUSE_NUM_RE.fullmatch(tokens[0].lower()):
+        tokens.pop(0)
+    return " ".join(tokens) if tokens else head
+
+
+def compute_cluster_value(total_reports: int, vuln_count: int, first_report_min_ago: int) -> dict:
+    """Emergency-framing value of catching a systemic event early.
+
+    Deliberately conservative and honest: the safety benefit is shown as
+    exposure-minutes and the flagged vulnerable household, NOT dollarized. Only the
+    avoidable field-dispatch cost is priced. Assumptions travel with the numbers so
+    the pitch can defend every figure under Shark Q&A.
+    """
+    trucks_without = total_reports          # one emergency roll per uncorrelated report
+    trucks_with = 1                         # correlated: one coordinated response to the main
+    trucks_saved = max(trucks_without - trucks_with, 0)
+    return {
+        "detection_lead_min": MANUAL_CORRELATION_LAG_MIN,
+        "first_report_min_ago": first_report_min_ago,
+        "affected_households": total_reports,
+        "vulnerable_household_count": vuln_count,
+        "exposure_minutes_avoided": MANUAL_CORRELATION_LAG_MIN * total_reports,
+        "trucks_without": trucks_without,
+        "trucks_with": trucks_with,
+        "trucks_saved": trucks_saved,
+        "dollars_saved": trucks_saved * EMERGENCY_TRUCK_ROLL_USD,
+        "assumptions": [
+            f"Platform correlates the pattern ~{MANUAL_CORRELATION_LAG_MIN} min before a supervisor would spot it manually.",
+            f"One emergency field dispatch (crew + vehicle + OT) is approximately ${EMERGENCY_TRUCK_ROLL_USD:,}.",
+            "Safety/exposure benefit shown as exposure-minutes and the flagged vulnerable household — deliberately not dollarized.",
+        ],
+    }
+
+
+def _cluster_summary(street_label: str, total_reports: int, dominant_hazard: str,
+                     first_report_min_ago: int, vuln_count: int) -> str:
+    """One-line systemic-event summary — human-readable and reused for prompt injection."""
+    vuln_clause = (
+        f" {vuln_count} vulnerable household{'s' if vuln_count != 1 else ''} on the same main."
+        if vuln_count else ""
+    )
+    return (
+        f"PROBABLE SYSTEMIC EVENT: {total_reports} {dominant_hazard} reports on {street_label} "
+        f"within {first_report_min_ago} min ({total_reports - 1} prior + this call)."
+        f"{vuln_clause} Treat as a possible {dominant_hazard}-main event, not an isolated incident."
+    )
+
+
+def detect_cluster(call: dict, incidents=INCIDENTS,
+                   window_min: int = CLUSTER_WINDOW_MIN, min_prior: int = CLUSTER_MIN_PRIOR) -> dict:
+    """Correlate the current call against prior reports on the same street/main.
+
+    Pure and deterministic — no model call. ALWAYS returns a dict (clustered True or
+    False) so the UI has a clean isolated-incident state; every field access is
+    .get()-guarded so a missing key can never raise mid-render on stage.
+    """
+    key = normalize_street(call.get("address", ""))
+    matched = [
+        i for i in incidents
+        if key and (i.get("street_key") or normalize_street(i.get("address", ""))) == key
+        and i.get("minutes_ago", 10 ** 9) <= window_min
+    ]
+    matched.sort(key=lambda i: i.get("minutes_ago", 0))          # most recent first
+    prior = len(matched)
+    total = prior + 1                                            # + the current call
+    clustered = prior >= min_prior
+    vuln = [i for i in matched if i.get("medical_dependent") or i.get("vulnerability_flag")]
+    hazards = [i.get("hazard_type", "unknown") for i in matched]
+    # sorted() before max() gives a stable tie-break (set iteration order is not
+    # deterministic), so a mixed-hazard main always labels the same way run to run.
+    dominant = max(sorted(set(hazards)), key=hazards.count) if hazards else "unknown"
+    first_min = max((i.get("minutes_ago", 0) for i in matched), default=0)  # earliest report
+    label = _street_label(call.get("address", ""))
+    value = compute_cluster_value(total, len(vuln), first_min) if clustered else {}
+    summary = _cluster_summary(label, total, dominant, first_min, len(vuln)) if clustered else ""
+    return {
+        "clustered": clustered,
+        "systemic_event": clustered,
+        "street_key": key,
+        "street_label": label,
+        "matched_incidents": matched,
+        "prior_count": prior,
+        "total_reports": total,
+        "dominant_hazard": dominant,
+        "vulnerable_neighbors": vuln,
+        "window_min": window_min,
+        "first_report_min_ago": first_min,
+        "value": value,
+        "summary": summary,
+    }
+
+
 # ------------------------------------------------------------------
 # Headless smoke test — the checkpoint artifact.
 #   GEMINI_API_KEY=... python agent.py
@@ -567,3 +760,15 @@ if __name__ == "__main__":
         for call in CALLS:
             result = _deterministic_call_decision(call)
             print(f"{call['caller_name']:<14} -> route={result['route']} (deterministic fallback)")
+
+    # Cross-incident cluster smoke — deterministic, no key needed. Expect Rosa (Maple
+    # St) to CLUSTER; Trevor (Birchwood) and Marcus (Cedar) to stay isolated.
+    print("\n=== Cross-Incident Clusters ===")
+    for call in CALLS:
+        c = detect_cluster(call)
+        verdict = "CLUSTER" if c["clustered"] else "isolated"
+        print(
+            f"{call['caller_name']:<14} @ {c['street_label']:<16} -> {verdict:<8} "
+            f"(prior={c['prior_count']}, total={c['total_reports']}, "
+            f"vuln={len(c['vulnerable_neighbors'])})"
+        )
