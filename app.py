@@ -70,6 +70,11 @@ MODE_CALL = "🚨 First Response"
 # First Response call sources — a canned demo call, or a live mic recording.
 SOURCE_CANNED = "📼 Canned call"
 SOURCE_LIVE = "🎙️ Live mic"
+SOURCE_VIDEO = "🎬 Demo video"
+
+# Bundled demo recording (a real gas-emergency call). The Demo-video source plays it and
+# transcribes the actual file LIVE via Gemini — stage-safe (no mic / room-noise dependency).
+_VIDEO = Path(__file__).parent / "assets" / "demo-call.mp4"
 
 # Account vulnerability flags for the live-capture dropdown. "None" is the empty sentinel
 # (mapped to "" at the call site) so downstream truthiness checks stay unchanged.
@@ -220,6 +225,8 @@ for _key, _default in [
     ("live_audio_sig", None),       # hash of the last transcribed audio (avoid re-calling)
     ("cluster", None),              # cross-incident cluster dict for the active call, or None
     ("queue_broadcast", "pending"), # proactive queue action state: pending | sent
+    ("video_transcript", ""),       # Gemini transcription of the bundled demo video
+    ("video_used_fallback", False), # True if the video transcript fell back (live call unavailable)
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -246,6 +253,8 @@ def _reset_loop() -> None:
     st.session_state.selected = None
     st.session_state.live_transcript = ""
     st.session_state.live_audio_sig = None
+    st.session_state.video_transcript = ""
+    st.session_state.video_used_fallback = False
     _clear_decision()
 
 
@@ -275,10 +284,11 @@ with st.sidebar:
             _select_customer(1)
             st.rerun()
     else:
-        # Canned demo call, or a live recording transcribed by Gemini.
+        # Canned demo call, a live mic recording, or the bundled demo video — all
+        # transcribed/analyzed by the same engine.
         call_source = st.radio(
-            "Call source", [SOURCE_CANNED, SOURCE_LIVE],
-            key="call_source", on_change=_reset_loop, horizontal=True,
+            "Call source", [SOURCE_CANNED, SOURCE_LIVE, SOURCE_VIDEO],
+            key="call_source", on_change=_reset_loop,
         )
         if call_source == SOURCE_CANNED:
             if st.button("🔴 Call A: Rosa (active leak, oxygen-dependent)", use_container_width=True):
@@ -290,8 +300,10 @@ with st.sidebar:
             if st.button("🟠 Call C: Marcus (downed power line, sparks)", use_container_width=True):
                 _select_customer(2)
                 st.rerun()
-        else:
+        elif call_source == SOURCE_LIVE:
             st.caption("🎙️ Record the caller in the main panel →")
+        else:  # SOURCE_VIDEO
+            st.caption("🎬 Play & transcribe the demo call in the main panel →")
 
     if st.button("↺ Reset", use_container_width=True):
         _reset_loop()
@@ -659,20 +671,28 @@ border:2px solid #0D9488;color:#E2E8F0;margin-top:0.3rem;">
         )
 
 
+def _account_inputs(key_prefix: str) -> "tuple[str, str]":
+    """Shared address + vulnerability-flag inputs for the live-mic and demo-video capture
+    panels. A flag is a fixed set (dropdown = better data quality); the "None" sentinel maps
+    to "" so downstream truthiness (bool(vuln) / vuln or None) is unchanged. Returns
+    (address, vuln). key_prefix keeps the two panels' widget keys distinct."""
+    c1, c2 = st.columns(2)
+    address = c1.text_input(
+        "Address (from caller ID / account)", value="418 Maple Street, Apt 2B", key=f"{key_prefix}_addr"
+    )
+    vuln_choice = c2.selectbox(
+        "Account vulnerability flag (optional)", VULN_OPTIONS, key=f"{key_prefix}_vuln"
+    )
+    return address, ("" if vuln_choice == "None" else vuln_choice)
+
+
 def _capture_live_call() -> "Dict[str, Any] | None":
     """Render the mic + caller inputs, transcribe a fresh recording with Gemini, and
     return a call record. Returns None while waiting for audio or on transcription failure."""
     st.markdown("### 🎙️ Live call capture")
     st.caption("Record the caller, then stop — Gemini transcribes what it heard.")
     audio = st.audio_input("Record the caller", help="Mic needs localhost or HTTPS.")
-    c1, c2 = st.columns(2)
-    address = c1.text_input("Address (from caller ID / account)", value="418 Maple Street, Apt 2B", key="live_addr")
-    # A flag is a fixed set, not free text — a dropdown improves data quality. "None" maps to
-    # "" so the downstream truthiness (bool(vuln) / vuln or None) is unchanged.
-    vuln_choice = c2.selectbox(
-        "Account vulnerability flag (optional)", VULN_OPTIONS, key="live_vuln",
-    )
-    vuln = "" if vuln_choice == "None" else vuln_choice
+    address, vuln = _account_inputs("live")
 
     if audio is None:
         st.markdown(
@@ -701,6 +721,59 @@ border-left:4px solid #22D3EE;color:#E2E8F0;font-weight:600;">
         "caller_name": "Live caller",
         "address": address,
         "transcript": transcript,
+        "medical_dependent": bool(vuln),
+        "account_vulnerability_flag": vuln or None,
+    }
+
+
+def _capture_video_call() -> "Dict[str, Any] | None":
+    """Demo-video source: play the bundled recording and transcribe the FILE live via Gemini.
+
+    Stage-safe by design — it transcribes the actual mp4 bytes (not room audio), and falls
+    back to agent.DEMO_VIDEO_TRANSCRIPT if the live call fails, so the beat always completes.
+    The address comes from the account/caller-ID field (as it would in a real contact centre),
+    which is what ties this call to the Maple St main so the cross-incident reveal fires.
+    """
+    st.markdown("### 🎬 Demo call — recorded emergency")
+    st.caption("Play the call for the room, then transcribe it live. WattNext hears the same audio you do.")
+    if _VIDEO.exists():
+        st.video(str(_VIDEO))
+    else:
+        st.warning(f"Demo video not found at `{_VIDEO}`. Add assets/demo-call.mp4 or use another source.")
+
+    address, vuln = _account_inputs("video")
+
+    if not st.session_state.video_transcript:
+        if not st.button("🎙️ Transcribe & analyze the call", type="primary", use_container_width=True):
+            st.markdown(
+                """<div style="padding:0.85rem 1.1rem;border-radius:0.6rem;background:#1E293B;
+border-left:4px solid #22D3EE;color:#E2E8F0;font-weight:600;">
+  ▶ Play the recording above, then transcribe it live.
+</div>""",
+                unsafe_allow_html=True,
+            )
+            return None
+        with st.spinner("Gemini is transcribing the call…"):
+            data = _VIDEO.read_bytes() if _VIDEO.exists() else b""
+            # Larger timeout than the mic path: a video file needs more time to upload +
+            # transcribe, so give the LIVE call margin before falling back on stage.
+            live = agent.transcribe_call(
+                st.session_state.client, data, mime_type="video/mp4", timeout_ms=45000
+            ) if data else ""
+            # Live transcription on stage; fall back to the captured transcript if it fails.
+            st.session_state.video_transcript = live or agent.DEMO_VIDEO_TRANSCRIPT
+            st.session_state.video_used_fallback = not bool(live)
+            _clear_decision()  # fresh transcript → replay the loop
+
+    if st.session_state.video_used_fallback:
+        st.caption(
+            "⚠️ Live transcription unavailable — using the bundled transcript. The demo still runs end-to-end."
+        )
+
+    return {
+        "caller_name": "Reported gas odor (recorded call)",
+        "address": address,
+        "transcript": st.session_state.video_transcript,
         "medical_dependent": bool(vuln),
         "account_vulnerability_flag": vuln or None,
     }
@@ -988,26 +1061,31 @@ def _run_decision(rec: Dict[str, Any], is_call: bool) -> None:
 is_call = st.session_state.mode == MODE_CALL
 
 if is_call:
-    # Live-mic source builds a record on the fly; canned source uses the sidebar pick.
-    is_live = st.session_state.get("call_source", SOURCE_CANNED) == SOURCE_LIVE
-    if is_live:
+    # Record source: canned pick, live mic, or the bundled demo video — the latter two
+    # build a record on the fly (transcribed by Gemini); canned uses the sidebar pick.
+    source = st.session_state.get("call_source", SOURCE_CANNED)
+    auto_run = source in (SOURCE_LIVE, SOURCE_VIDEO)  # these self-trigger; canned waits for ▶ Play
+    if source == SOURCE_LIVE:
         rec = _capture_live_call()
         if rec is None:
             st.stop()  # waiting for a recording + transcript
+    elif source == SOURCE_VIDEO:
+        rec = _capture_video_call()
+        if rec is None:
+            st.stop()  # waiting for the play + transcribe click
     else:
         if st.session_state.selected is None:
-            st.info("👈 Pick a call from the sidebar — or switch Call source to 🎙️ Live mic.")
+            st.info("👈 Pick a call from the sidebar — or switch Call source to 🎙️ Live mic / 🎬 Demo video.")
             st.stop()
         rec = agent.CALLS[st.session_state.selected]
     _render_detect_call(rec)
 
-    # HERO reveal. Canned calls wait for a "▶ Play call" click (a scripted, on-cue
-    # demo moment). The live-mic path AUTO-RUNS the instant the recording stops —
-    # the browser only hands us the audio on stop, so this is the honest "the call
-    # ends, the copilot already has the answer" moment, no separate click. Both paths
-    # then share the same replay + one-real-decision code below.
+    # HERO reveal. Canned calls wait for a "▶ Play call" click (a scripted, on-cue demo
+    # moment). The live-mic and demo-video paths AUTO-RUN once their audio is in hand
+    # (recording stopped / video transcribed) — the honest "the call ends, the copilot
+    # already has the answer" moment. All paths share the replay + one-real-decision below.
     if not st.session_state.call_played:
-        if not is_live:
+        if not auto_run:
             st.caption("▶ Press play — the copilot analyzes the call as the caller speaks.")
             if not st.button("▶ Play call", type="primary", use_container_width=True):
                 st.stop()  # canned: wait for the on-cue click

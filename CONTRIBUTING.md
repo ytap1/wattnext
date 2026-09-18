@@ -35,10 +35,10 @@ merge workflow below.
 venv\Scripts\python.exe test_app.py
 ```
 
-Must print **`15 passed`** (`14 passed, 1 skipped` in CI without a key — the live-Gemini test
+Must print **`18 passed`** (`17 passed, 1 skipped` in CI without a key — the live-Gemini test
 self-skips). This checks the accept/decline flow, the debug panels, the cross-incident cluster
-detection + intelligence panel, the proactive queue intelligence + broadcast action, and that
-the **live Gemini call still works** — catching a broken
+detection + intelligence panel, the proactive queue intelligence + broadcast action, the demo-video
+scenario (cluster + dispatch offline), and that the **live Gemini call still works** — catching a broken
 flow or a dead key *before* it reaches the live demo. Do not push on a red test.
 
 ## Current work: the v2 rebuild (integration branch)

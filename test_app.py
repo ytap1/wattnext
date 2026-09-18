@@ -322,6 +322,48 @@ def test_queue_broadcast_flow_offline():
     assert "Area safety alert sent" in _md(at), "broadcast confirmation missing"
 
 
+# ---- demo-video path -------------------------------------------------------
+def test_demo_video_scenario_routes_and_clusters():
+    """The bundled demo-video scenario (its transcript at a Maple St account address) must
+    fire the cluster and route DISPATCH_NOW on the deterministic path — so the on-stage beat
+    holds even if the live transcription falls back."""
+    rec = {
+        "caller_name": "Reported gas odor (recorded call)",
+        "address": "418 Maple Street, Apt 2B",
+        "transcript": agent.DEMO_VIDEO_TRANSCRIPT,
+        "medical_dependent": False,
+        "account_vulnerability_flag": None,
+    }
+    assert agent.detect_cluster(rec)["clustered"], "demo-video record should fire the Maple cluster"
+    assert agent._deterministic_call_decision(rec)["route"] == "DISPATCH_NOW", (
+        "demo-video transcript should route to dispatch on the deterministic path"
+    )
+
+
+def test_transcribe_call_accepts_timeout_arg():
+    """The Demo-video path passes a larger timeout; guard the signature so it can't regress."""
+    import inspect
+    assert "timeout_ms" in inspect.signature(agent.transcribe_call).parameters
+
+
+def test_demo_video_source_flow_offline():
+    """End-to-end guard for the demo centerpiece: selecting 🎬 Demo video and transcribing
+    runs the full reveal. Offline-safe — with a dummy key the transcription falls back to the
+    bundled transcript and the beat still fires the cluster + dispatch."""
+    at = AppTest.from_file(APP, default_timeout=90)
+    at.secrets["GEMINI_API_KEY"] = agent._load_api_key() or "ci-dummy-key"
+    at.run()
+    assert not at.exception, f"app raised on startup: {at.exception}"
+    at.radio(key="call_source").set_value("🎬 Demo video").run()
+    assert not at.exception, f"selecting demo video raised: {at.exception}"
+    _click(at, "Transcribe & analyze")
+    at.run()
+    assert not at.exception, f"video path raised: {at.exception}"
+    md = _md(at)
+    assert "SYSTEMIC" in md and "Maple" in md, "cluster reveal missing on the video path"
+    assert "Dispatch" in md, "dispatch decision missing on the video path"
+
+
 # ---- plain-python runner (no pytest needed) --------------------------------
 if __name__ == "__main__":
     import sys
@@ -334,6 +376,8 @@ if __name__ == "__main__":
         test_cluster_panel_renders_offline, test_cluster_isolated_panel_renders_for_trevor,
         test_triage_queue_flags_same_main_for_rosa, test_triage_queue_noop_without_cluster,
         test_queue_broadcast_flow_offline,
+        test_demo_video_scenario_routes_and_clusters, test_transcribe_call_accepts_timeout_arg,
+        test_demo_video_source_flow_offline,
         test_live_decision,
     ]
     passed = failures = skipped = 0

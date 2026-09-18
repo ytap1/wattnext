@@ -439,13 +439,33 @@ CALLS = [
 ]
 
 
-def transcribe_call(client: genai.Client, audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
-    """Transcribe a recorded call with Gemini (multimodal audio -> text).
+# Fallback transcript for the bundled demo video (assets/demo-call.mp4), captured from a
+# live Gemini transcription of that file. The Demo-video path transcribes the file LIVE on
+# stage; if the live call fails (wifi), the UI falls back to this so the beat still completes.
+DEMO_VIDEO_TRANSCRIPT = (
+    "Agent: Thank you for calling, my name is Faye — are you experiencing a gas emergency? "
+    "Caller: Yeah, I'm a passer-by and I want to report a strong odor of gas. It's like rotten eggs. "
+    "Agent: Aside from smelling the gas, can you also see, feel, or hear it? "
+    "Caller: No, just a smell. "
+    "Agent: Okay, may I have the full address, please? Please stay at least 100 feet from the gas "
+    "odor. Do not operate any gas or electrical devices that can cause a spark — no open fires, flames, "
+    "smoking, or use of the telephone within the area. Let me call gas dispatch to confirm the ticket, "
+    "stay on the line, please."
+)
 
-    A SUPPORTING call, separate from decide(): the mic gives us audio, this turns it
-    into the transcript that decide() then triages. Same primary->fallback model
-    resilience; returns "" on failure so the caller can fall back to a canned/typed
+
+def transcribe_call(client: genai.Client, audio_bytes: bytes, mime_type: str = "audio/wav",
+                    timeout_ms: int = 10000) -> str:
+    """Transcribe a recorded call with Gemini (multimodal audio/video -> text).
+
+    A SUPPORTING call, separate from decide(): the mic (or a demo video) gives us media,
+    this turns it into the transcript that decide() then triages. Same primary->fallback
+    model resilience; returns "" on failure so the caller can fall back to a canned/typed
     transcript instead of hanging the demo.
+
+    timeout_ms is the per-request deadline (API minimum 10000). A short mic clip is fine at
+    the default; a video file is larger to upload + process, so the Demo-video path passes a
+    larger value (~45s) to give the LIVE transcription margin before it falls back on stage.
     """
     prompt = (
         "Transcribe this emergency utility phone call verbatim. "
@@ -454,7 +474,7 @@ def transcribe_call(client: genai.Client, audio_bytes: bytes, mime_type: str = "
     audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
     config = types.GenerateContentConfig(
         temperature=0.0,
-        http_options=types.HttpOptions(timeout=10000),
+        http_options=types.HttpOptions(timeout=max(timeout_ms, 10000)),
     )
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
