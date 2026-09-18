@@ -19,6 +19,7 @@ import hashlib
 import html
 import re
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterator, Sequence
 
@@ -69,6 +70,11 @@ MODE_CALL = "🚨 First Response"
 # First Response call sources — a canned demo call, or a live mic recording.
 SOURCE_CANNED = "📼 Canned call"
 SOURCE_LIVE = "🎙️ Live mic"
+SOURCE_VIDEO = "🎬 Demo video"
+
+# Bundled demo recording (a real gas-emergency call). The Demo-video source plays it and
+# transcribes the actual file LIVE via Gemini — stage-safe (no mic / room-noise dependency).
+_VIDEO = Path(__file__).parent / "assets" / "demo-call.mp4"
 
 # Account vulnerability flags for the live-capture dropdown. "None" is the empty sentinel
 # (mapped to "" at the call site) so downstream truthiness checks stay unchanged.
@@ -98,10 +104,11 @@ with _hero_word:
 # Constant brand line — the flexible engine is the hero; the domain is just what it's pointed at.
 st.markdown("**One flexible agent for the utility contact center — point it at a new problem, it adapts.**")
 if _active_mode == MODE_CALL:
-    st.subheader("First-Response Triage Agent")
+    st.subheader("Live-Call Copilot — First Response")
     st.caption(
-        "One real **Google Gemini** reasoning call — severity tier, routing decision, and a "
-        "dispatch packet. The *same* engine that resolves bill shock, pointed at a hazard call."
+        "A copilot for the contact-center **agent**: it listens as the caller speaks, analyzes "
+        "in the background, and hands the agent a verified-ready decision — severity tier, routing, "
+        "and a dispatch packet. The *same* engine that resolves bill shock, pointed at a hazard call."
     )
 else:
     st.subheader("The Kill Bill Shock Agent")
@@ -161,6 +168,19 @@ ROUTE_STYLE: Dict[str, Dict[str, str]] = {
 # two-branch dry run pushes the 5-min slot (see HACKATHON.md W5).
 STEP_DELAY_SEC = 0.5
 
+# Per-chunk delay for the live-call replay (First Response hero). The transcript
+# reveals a chunk at a time while the danger-signal dashboard re-populates in sync,
+# so the copilot visibly keeps pace with the caller. Trim alongside STEP_DELAY_SEC.
+PLAY_DELAY_SEC = 0.7
+PLAY_MAX_CHUNKS = 5  # cap reveal steps so a long live transcript can't overrun the slot
+
+# Kill-switch for cross-incident prompt injection. When True, a detected systemic
+# cluster is threaded into the single real decision's prompt so its reasoning can cite
+# the pattern. Flip to False to ship the intelligence PANEL untouched while leaving the
+# live prompt exactly as-is — a safety valve if the model misbehaves off-stage. The
+# panel itself is deterministic and never depends on this flag.
+CLUSTER_PROMPT_INJECTION = True
+
 
 # ============================================================
 # 1) SECRETS + CLIENT (once per session)
@@ -197,11 +217,16 @@ if "client" not in st.session_state:
 for _key, _default in [
     ("selected", None),      # index into agent.CUSTOMERS/CALLS, or None
     ("decision", None),      # last decision dict, or None
+    ("call_played", False),         # whether the live-call replay has run for this record
     ("log_done", False),            # whether the staged reveal has already played
     ("deliver_status", "pending"),  # pending | accepted | declined
     ("decision_latency", None),     # seconds the live DECIDE call took
     ("live_transcript", ""),        # Gemini transcription of the recorded call
     ("live_audio_sig", None),       # hash of the last transcribed audio (avoid re-calling)
+    ("cluster", None),              # cross-incident cluster dict for the active call, or None
+    ("queue_broadcast", "pending"), # proactive queue action state: pending | sent
+    ("video_transcript", ""),       # Gemini transcription of the bundled demo video
+    ("video_used_fallback", False), # True if the video transcript fell back (live call unavailable)
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -210,8 +235,11 @@ for _key, _default in [
 def _clear_decision() -> None:
     """Reset just the DECIDE/DELIVER state (a fresh record → replay the loop)."""
     st.session_state.decision = None
+    st.session_state.call_played = False
     st.session_state.log_done = False
     st.session_state.deliver_status = "pending"
+    st.session_state.cluster = None
+    st.session_state.queue_broadcast = "pending"
 
 
 def _select_customer(idx: int) -> None:
@@ -225,6 +253,8 @@ def _reset_loop() -> None:
     st.session_state.selected = None
     st.session_state.live_transcript = ""
     st.session_state.live_audio_sig = None
+    st.session_state.video_transcript = ""
+    st.session_state.video_used_fallback = False
     _clear_decision()
 
 
@@ -254,10 +284,11 @@ with st.sidebar:
             _select_customer(1)
             st.rerun()
     else:
-        # Canned demo call, or a live recording transcribed by Gemini.
+        # Canned demo call, a live mic recording, or the bundled demo video — all
+        # transcribed/analyzed by the same engine.
         call_source = st.radio(
-            "Call source", [SOURCE_CANNED, SOURCE_LIVE],
-            key="call_source", on_change=_reset_loop, horizontal=True,
+            "Call source", [SOURCE_CANNED, SOURCE_LIVE, SOURCE_VIDEO],
+            key="call_source", on_change=_reset_loop,
         )
         if call_source == SOURCE_CANNED:
             if st.button("🔴 Call A: Rosa (active leak, oxygen-dependent)", use_container_width=True):
@@ -269,8 +300,10 @@ with st.sidebar:
             if st.button("🟠 Call C: Marcus (downed power line, sparks)", use_container_width=True):
                 _select_customer(2)
                 st.rerun()
-        else:
+        elif call_source == SOURCE_LIVE:
             st.caption("🎙️ Record the caller in the main panel →")
+        else:  # SOURCE_VIDEO
+            st.caption("🎬 Play & transcribe the demo call in the main panel →")
 
     if st.button("↺ Reset", use_container_width=True):
         _reset_loop()
@@ -325,7 +358,7 @@ def _render_detect_call(call: Dict[str, Any]) -> None:
 color:#FFFFFF;margin-bottom:0.5rem;">
   <div style="font-size:1.15rem;font-weight:800;">📞 INCOMING HAZARD CALL — {call.get('caller_name')}</div>
   <div style="font-size:1.05rem;font-weight:700;margin:0.15rem 0;">📍 {call.get('address')}</div>
-  <div style="margin-top:0.35rem;font-weight:500;opacity:0.95;">Awaiting triage — nothing dispatched until a human dispatcher confirms.</div>
+  <div style="margin-top:0.35rem;font-weight:500;opacity:0.95;">Awaiting triage — nothing dispatched until a human agent confirms.</div>
 </div>""",
         unsafe_allow_html=True,
     )
@@ -445,20 +478,221 @@ background:rgba(255,255,255,0.05);line-height:1.7;">{_highlight(transcript, dang
         )
 
 
+def _render_incident_intelligence(call: Dict[str, Any], cluster: "Dict[str, Any] | None") -> None:
+    """Cross-incident intelligence panel — the WattNext differentiator.
+
+    Correlates this call against recent reports on the same main and, when a systemic
+    pattern emerges, flags a probable main event + vulnerable households for proactive
+    outreach, with a quantified value strip. Reads detect_cluster() output ONLY (never
+    model output), so it renders identically live or on the deterministic fallback.
+    """
+    if not cluster:
+        return
+    st.markdown("### 🛰️ Cross-incident intelligence")
+
+    if not cluster.get("clustered"):
+        prior = cluster.get("prior_count", 0)
+        label = cluster.get("street_label", "this area")
+        hours = max(cluster.get("window_min", 120) // 60, 1)
+        rpt = f"{prior} prior report{'s' if prior != 1 else ''}"
+        st.markdown(
+            f"""<div style="padding:0.9rem 1.1rem;border-radius:0.6rem;background:#111C31;
+border:1px solid #334155;border-left:4px solid #22D3EE;color:#E2E8F0;">
+  <div style="font-weight:800;color:#38BDF8;">🛰️ No systemic pattern — isolated incident</div>
+  <div style="margin-top:0.3rem;font-size:0.92rem;color:#94A3B8;">
+    {rpt} on {html.escape(label)} in the last {hours}h — below the cluster threshold.
+    Handled as a single call. <b>No false alarm raised.</b>
+  </div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption("Proof it doesn't cry wolf: one main, one report, no manufactured pattern.")
+        return
+
+    # --- Clustered: a probable systemic event ---
+    label = cluster.get("street_label", "this area")
+    hazard = cluster.get("dominant_hazard", "utility")
+    val = cluster.get("value", {}) or {}
+    st.markdown(
+        f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;
+background:linear-gradient(90deg,#B71C1C 0%,#CA8A04 100%);color:#FFFFFF;margin-bottom:0.5rem;">
+  <div style="font-size:1.15rem;font-weight:800;">⚠️ PROBABLE SYSTEMIC EVENT</div>
+  <div style="font-size:1rem;font-weight:700;margin-top:0.15rem;">
+    Possible {html.escape(hazard)}-main event on {html.escape(label)} — not an isolated leak
+  </div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Reports on this main", cluster.get("total_reports", 0))
+    m2.metric("Within", f"{cluster.get('first_report_min_ago', 0)} min")
+    m3.metric("Vulnerable households", len(cluster.get("vulnerable_neighbors", [])))
+    m4.metric("Detected earlier", f"~{val.get('detection_lead_min', 0)} min")
+
+    st.markdown("**📍 Correlated reports on this main**")
+    rows = []
+    for inc in cluster.get("matched_incidents", []):
+        vflag = inc.get("vulnerability_flag")
+        chip = (
+            f' <span style="background:#CA8A04;color:#fff;padding:1px 7px;border-radius:10px;'
+            f'font-size:0.72rem;font-weight:700;">{html.escape(vflag)}</span>' if vflag else ""
+        )
+        status = html.escape(str(inc.get("status", "")).replace("_", " "))
+        rows.append(
+            f"""<div style="padding:0.4rem 0.7rem;border-left:3px solid #B71C1C;margin:0.25rem 0;
+background:rgba(255,255,255,0.04);border-radius:0.35rem;">
+  <b>{html.escape(inc.get('id',''))}</b> · {html.escape(inc.get('address',''))}
+  · {inc.get('minutes_ago','?')} min ago · <i>{status}</i>{chip}
+  <div style="font-size:0.82rem;color:#94A3B8;margin-top:0.1rem;">{html.escape(inc.get('summary',''))}</div>
+</div>"""
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True)
+
+    # Proactive vulnerable-household outreach — the life-safety differentiator.
+    vuln = cluster.get("vulnerable_neighbors", [])
+    if vuln:
+        names = "; ".join(
+            f"{html.escape(v.get('address',''))} "
+            f"({html.escape(v.get('vulnerability_flag') or 'vulnerable')})"
+            for v in vuln
+        )
+        st.markdown(
+            f"""<div style="padding:0.85rem 1.1rem;border-radius:0.6rem;background:#3B2A00;
+border:1px solid #CA8A04;border-left:4px solid #FACC15;color:#FDE68A;margin-top:0.4rem;">
+  <div style="font-weight:800;">📞 Proactive outreach — vulnerable household on this main</div>
+  <div style="margin-top:0.25rem;color:#FEF3C7;">{names}</div>
+  <div style="font-size:0.82rem;color:#D6B08C;margin-top:0.2rem;">
+    Flagged for a wellness call <b>before they dial in</b> — the platform knows they're on the affected main.
+  </div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+
+    # Quantified value strip — emergency framing, conservative + labeled.
+    st.markdown(
+        f"""<div style="margin-top:0.5rem;padding:0.8rem 1rem;border-radius:0.6rem;
+background:#052E2B;border:1px solid #0D9488;border-left:4px solid #22D3EE;">
+  <div style="font-weight:800;color:#5EEAD4;">💡 Value of catching it early</div>
+  <div style="display:flex;flex-wrap:wrap;gap:1.4rem;margin-top:0.4rem;color:#E2E8F0;">
+    <div><b style="color:#22D3EE;font-size:1.25rem;">{val.get('exposure_minutes_avoided',0)}</b><br>
+      <span style="font-size:0.8rem;color:#94A3B8;">exposure-minutes acted on sooner</span></div>
+    <div><b style="color:#22D3EE;font-size:1.25rem;">{val.get('trucks_without',0)} &rarr; {val.get('trucks_with',0)}</b><br>
+      <span style="font-size:0.8rem;color:#94A3B8;">emergency truck-rolls (consolidated)</span></div>
+    <div><b style="color:#22D3EE;font-size:1.25rem;">${val.get('dollars_saved',0):,}</b><br>
+      <span style="font-size:0.8rem;color:#94A3B8;">avoidable dispatch cost, this event</span></div>
+  </div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Cross-incident intelligence — deterministic, no extra AI call. No single call "
+        "transcript reveals this. The dollar figure prices only avoidable dispatches; the "
+        "safety benefit is shown as exposure-minutes and the flagged household — deliberately not dollarized."
+    )
+
+
+def _render_queue_intelligence(cluster: "Dict[str, Any] | None") -> None:
+    """Proactive action on callers STILL HOLDING in the queue during a systemic event.
+
+    Only appears when a cluster fired: finds the queued callers on the same main, orders
+    them vulnerable-first, and offers ONE broadcast safety alert that reaches them all in
+    seconds and collapses that main's queue to a single coordinated response. Deterministic
+    (reads triage_queue()), human-in-the-loop (a supervisor confirms the broadcast).
+    """
+    if not cluster or not cluster.get("clustered"):
+        return
+    qr = agent.triage_queue(agent.QUEUE, cluster)
+    if not qr.get("active") or not qr.get("same_main"):
+        return
+
+    st.markdown("### 📞 Queue intelligence — proactive")
+    st.caption(
+        f"While the agent handles this call, {qr['reached']} others from "
+        f"{qr['street_label']} are holding in the queue — same main, same event."
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Waiting on this main", qr["reached"])
+    m2.metric("Longest wait", f"{qr['longest_wait_min']} min")
+    m3.metric("Vulnerable in queue", qr["prioritized_count"])
+    m4.metric("Agent-minutes freed", qr["agent_minutes_freed"])
+
+    rows = []
+    for rank, q in enumerate(qr["same_main"], start=1):
+        vflag = q.get("vulnerability_flag")
+        chip = (
+            f' <span style="background:#CA8A04;color:#fff;padding:1px 7px;border-radius:10px;'
+            f'font-size:0.72rem;font-weight:700;">{html.escape(vflag)}</span>' if vflag else ""
+        )
+        border = "#CA8A04" if agent._queue_is_vulnerable(q) else "#334155"
+        rows.append(
+            f"""<div style="padding:0.4rem 0.7rem;border-left:3px solid {border};margin:0.25rem 0;
+background:rgba(255,255,255,0.04);border-radius:0.35rem;">
+  <b>#{rank}</b> · {html.escape(q.get('caller_name',''))} · {html.escape(q.get('address',''))}
+  · waiting {q.get('waiting_min','?')} min{chip}
+  <div style="font-size:0.82rem;color:#94A3B8;margin-top:0.1rem;">“{html.escape(q.get('reason',''))}”</div>
+</div>"""
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True)
+
+    if st.session_state.queue_broadcast == "pending":
+        st.markdown(
+            f"""<div style="padding:0.85rem 1.1rem;border-radius:0.6rem;background:#111C31;
+border:2px dashed #22D3EE;color:#E2E8F0;margin-top:0.3rem;">
+  <div style="font-weight:800;color:#38BDF8;">📣 Prepared: one action for the whole main</div>
+  <div style="margin-top:0.25rem;font-size:0.9rem;color:#94A3B8;">
+    Broadcast an area safety alert to all {qr['reached']} waiting callers on {html.escape(qr['street_label'])}
+    (“Gas detected in your area — evacuate now, crew en route”) and bump the
+    {qr['prioritized_count']} vulnerable callers to a live agent.
+  </div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        if st.button("📣 Broadcast area safety alert + prioritize vulnerable",
+                     type="primary", use_container_width=True, key="queue_broadcast_btn"):
+            st.session_state.queue_broadcast = "sent"
+            st.rerun()
+        st.caption("Nothing goes out until a supervisor confirms — the human stays in the loop.")
+    else:
+        st.markdown(
+            f"""<div style="padding:0.9rem 1.1rem;border-radius:0.6rem;background:#052E2B;
+border:2px solid #0D9488;color:#E2E8F0;margin-top:0.3rem;">
+  <div style="font-weight:800;color:#5EEAD4;">✅ Area safety alert sent to {qr['reached']} callers</div>
+  <div style="margin-top:0.3rem;">Queue for {html.escape(qr['street_label'])} collapsed
+    <b>{qr['reached']} &rarr; 1</b> coordinated response ·
+    <b>{qr['prioritized_count']}</b> vulnerable prioritized for a live agent ·
+    <b>{qr['deflected']}</b> info-only callers answered without waiting.</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "DELIVER is mocked — in production this fires the SMS/IVR broadcast and re-orders the "
+            "live queue. Vulnerable callers are prioritized, never deflected."
+        )
+
+
+def _account_inputs(key_prefix: str) -> "tuple[str, str]":
+    """Shared address + vulnerability-flag inputs for the live-mic and demo-video capture
+    panels. A flag is a fixed set (dropdown = better data quality); the "None" sentinel maps
+    to "" so downstream truthiness (bool(vuln) / vuln or None) is unchanged. Returns
+    (address, vuln). key_prefix keeps the two panels' widget keys distinct."""
+    c1, c2 = st.columns(2)
+    address = c1.text_input(
+        "Address (from caller ID / account)", value="418 Maple Street, Apt 2B", key=f"{key_prefix}_addr"
+    )
+    vuln_choice = c2.selectbox(
+        "Account vulnerability flag (optional)", VULN_OPTIONS, key=f"{key_prefix}_vuln"
+    )
+    return address, ("" if vuln_choice == "None" else vuln_choice)
+
+
 def _capture_live_call() -> "Dict[str, Any] | None":
     """Render the mic + caller inputs, transcribe a fresh recording with Gemini, and
     return a call record. Returns None while waiting for audio or on transcription failure."""
     st.markdown("### 🎙️ Live call capture")
     st.caption("Record the caller, then stop — Gemini transcribes what it heard.")
     audio = st.audio_input("Record the caller", help="Mic needs localhost or HTTPS.")
-    c1, c2 = st.columns(2)
-    address = c1.text_input("Address (from caller ID / account)", value="418 Maple Street, Apt 2B", key="live_addr")
-    # A flag is a fixed set, not free text — a dropdown improves data quality. "None" maps to
-    # "" so the downstream truthiness (bool(vuln) / vuln or None) is unchanged.
-    vuln_choice = c2.selectbox(
-        "Account vulnerability flag (optional)", VULN_OPTIONS, key="live_vuln",
-    )
-    vuln = "" if vuln_choice == "None" else vuln_choice
+    address, vuln = _account_inputs("live")
 
     if audio is None:
         st.markdown(
@@ -487,6 +721,59 @@ border-left:4px solid #22D3EE;color:#E2E8F0;font-weight:600;">
         "caller_name": "Live caller",
         "address": address,
         "transcript": transcript,
+        "medical_dependent": bool(vuln),
+        "account_vulnerability_flag": vuln or None,
+    }
+
+
+def _capture_video_call() -> "Dict[str, Any] | None":
+    """Demo-video source: play the bundled recording and transcribe the FILE live via Gemini.
+
+    Stage-safe by design — it transcribes the actual mp4 bytes (not room audio), and falls
+    back to agent.DEMO_VIDEO_TRANSCRIPT if the live call fails, so the beat always completes.
+    The address comes from the account/caller-ID field (as it would in a real contact centre),
+    which is what ties this call to the Maple St main so the cross-incident reveal fires.
+    """
+    st.markdown("### 🎬 Demo call — recorded emergency")
+    st.caption("Play the call for the room, then transcribe it live. WattNext hears the same audio you do.")
+    if _VIDEO.exists():
+        st.video(str(_VIDEO))
+    else:
+        st.warning(f"Demo video not found at `{_VIDEO}`. Add assets/demo-call.mp4 or use another source.")
+
+    address, vuln = _account_inputs("video")
+
+    if not st.session_state.video_transcript:
+        if not st.button("🎙️ Transcribe & analyze the call", type="primary", use_container_width=True):
+            st.markdown(
+                """<div style="padding:0.85rem 1.1rem;border-radius:0.6rem;background:#1E293B;
+border-left:4px solid #22D3EE;color:#E2E8F0;font-weight:600;">
+  ▶ Play the recording above, then transcribe it live.
+</div>""",
+                unsafe_allow_html=True,
+            )
+            return None
+        with st.spinner("Gemini is transcribing the call…"):
+            data = _VIDEO.read_bytes() if _VIDEO.exists() else b""
+            # Larger timeout than the mic path: a video file needs more time to upload +
+            # transcribe, so give the LIVE call margin before falling back on stage.
+            live = agent.transcribe_call(
+                st.session_state.client, data, mime_type="video/mp4", timeout_ms=45000
+            ) if data else ""
+            # Live transcription on stage; fall back to the captured transcript if it fails.
+            st.session_state.video_transcript = live or agent.DEMO_VIDEO_TRANSCRIPT
+            st.session_state.video_used_fallback = not bool(live)
+            _clear_decision()  # fresh transcript → replay the loop
+
+    if st.session_state.video_used_fallback:
+        st.caption(
+            "⚠️ Live transcription unavailable — using the bundled transcript. The demo still runs end-to-end."
+        )
+
+    return {
+        "caller_name": "Reported gas odor (recorded call)",
+        "address": address,
+        "transcript": st.session_state.video_transcript,
         "medical_dependent": bool(vuln),
         "account_vulnerability_flag": vuln or None,
     }
@@ -656,11 +943,11 @@ background:rgba(255,255,255,0.05);">
   <div style="font-size:1.05rem;font-weight:800;color:{style['fg']};">{style['icon']} {style['label']}</div>
   <div style="margin-top:0.2rem;opacity:0.9;">{decision.get('rationale','')}</div>
   {packet_rows}
-  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">🧾 Packet prepared — dispatcher's call</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">🧾 Packet prepared — agent's call</div>
 </div>""",
             unsafe_allow_html=True,
         )
-        st.caption("The agent triaged the call and prepared the packet. **Nothing is dispatched until a human dispatcher confirms.**")
+        st.caption("The copilot triaged the call and prepared the packet. **Nothing is dispatched until the human agent confirms.**")
         col_go, col_hold = st.columns(2)
         if col_go.button("🚑 Dispatch responder", type="primary", use_container_width=True, key="dispatch_action"):
             st.session_state.deliver_status = "dispatched"
@@ -676,7 +963,7 @@ background:rgba(255,255,255,0.05);">
   <div style="font-size:1.05rem;font-weight:800;color:{style['fg']};">{style['icon']} {style['label']}</div>
   {packet_rows}
   <div style="margin-top:0.3rem;"><b>Dispatch ref #:</b> <code>{ref}</code></div>
-  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">✅ Dispatcher confirmed — packet sent to responder</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{style['fg']};">✅ Agent confirmed — packet sent to responder</div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -687,10 +974,10 @@ background:rgba(255,255,255,0.05);">
         st.markdown(
             f"""<div style="padding:1rem 1.15rem;border-radius:0.6rem;border:2px solid {review['fg']};
 background:rgba(255,255,255,0.05);">
-  <div style="font-size:1.05rem;font-weight:800;color:{review['fg']};">{review['icon']} Held for dispatcher review</div>
-  <div style="margin-top:0.4rem;">No responder was dispatched. A dispatcher will review the packet before any action.</div>
+  <div style="font-size:1.05rem;font-weight:800;color:{review['fg']};">{review['icon']} Held for agent review</div>
+  <div style="margin-top:0.4rem;">No responder was dispatched. The agent will review the packet before any action.</div>
   <div style="margin-top:0.2rem;"><b>Reference #:</b> <code>{ref}</code></div>
-  <div style="margin-top:0.55rem;font-weight:800;color:{review['fg']};">✋ Awaiting human dispatcher</div>
+  <div style="margin-top:0.55rem;font-weight:800;color:{review['fg']};">✋ Awaiting human agent</div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -701,6 +988,72 @@ background:rgba(255,255,255,0.05);">
 
 
 # ============================================================
+# 6b) LIVE-CALL REPLAY
+#     The hero interaction: one "▶ Play call" click reveals the transcript a
+#     chunk at a time while the danger-signal dashboard populates in sync, so the
+#     copilot is SEEN keeping pace with the caller — then the one real decision lands.
+# ============================================================
+def _split_sentences(text: str) -> list:
+    """Split a transcript into sentence-ish chunks for progressive reveal."""
+    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+    return [p for p in parts if p]
+
+
+def _play_chunks(text: str, max_chunks: int = PLAY_MAX_CHUNKS) -> list:
+    """Sentences for reveal, merged into at most `max_chunks` groups so a long
+    (e.g. live-mic) transcript can't overrun the demo slot."""
+    sents = _split_sentences(text)
+    if len(sents) <= max_chunks:
+        return sents
+    size = -(-len(sents) // max_chunks)  # ceil division
+    return [" ".join(sents[i:i + size]) for i in range(0, len(sents), size)]
+
+
+def _play_call(call: Dict[str, Any]) -> None:
+    """Reveal the transcript chunk-by-chunk, re-rendering the danger-signal
+    dashboard on the accumulated text each step (decision is still None here, so
+    the dashboard shows its preview severity). Blocking — plays during the click
+    run, exactly like the decision-log staged reveal already does."""
+    chunks = _play_chunks(call.get("transcript") or "")
+    if not chunks:
+        return
+    ph = st.empty()
+    acc = ""
+    for i, chunk in enumerate(chunks, start=1):
+        acc = f"{acc} {chunk}".strip()
+        with ph.container():
+            st.caption(f"🔴 Live call in progress — copilot analyzing… ({i}/{len(chunks)})")
+            _render_signal_dashboard({**call, "transcript": acc})
+        time.sleep(PLAY_DELAY_SEC)
+
+
+def _run_decision(rec: Dict[str, Any], is_call: bool) -> None:
+    """Fire the ONE real Gemini decision call and record its latency."""
+    with st.spinner(f"Copilot reasoning… (real Gemini call · {agent.PRIMARY_MODEL})"):
+        _t0 = time.time()
+        if is_call:
+            # Cross-incident cluster — deterministic, NO extra model call. Optionally
+            # thread a clustered summary into THIS one call's prompt via functools.partial
+            # so the reasoning can cite the systemic pattern; decide() stays untouched.
+            cluster = agent.detect_cluster(rec)
+            st.session_state.cluster = cluster
+            build_fn = (
+                partial(agent.build_call_prompt, cluster=cluster)
+                if (CLUSTER_PROMPT_INJECTION and cluster.get("clustered"))
+                else agent.build_call_prompt
+            )
+            st.session_state.decision = agent.decide(
+                st.session_state.client, rec,
+                build_prompt_fn=build_fn,
+                deterministic_fn=agent._deterministic_call_decision,
+                valid_routes=agent.CALL_ROUTES,
+            )
+        else:
+            st.session_state.decision = agent.decide(st.session_state.client, rec)
+        st.session_state.decision_latency = round(time.time() - _t0, 2)
+
+
+# ============================================================
 # 7) MAIN LAYOUT
 # ============================================================
 # Branch on the active domain. The DECIDE stage (decision log) is shared; only the
@@ -708,18 +1061,48 @@ background:rgba(255,255,255,0.05);">
 is_call = st.session_state.mode == MODE_CALL
 
 if is_call:
-    # Live-mic source builds a record on the fly; canned source uses the sidebar pick.
-    if st.session_state.get("call_source", SOURCE_CANNED) == SOURCE_LIVE:
+    # Record source: canned pick, live mic, or the bundled demo video — the latter two
+    # build a record on the fly (transcribed by Gemini); canned uses the sidebar pick.
+    source = st.session_state.get("call_source", SOURCE_CANNED)
+    auto_run = source in (SOURCE_LIVE, SOURCE_VIDEO)  # these self-trigger; canned waits for ▶ Play
+    if source == SOURCE_LIVE:
         rec = _capture_live_call()
         if rec is None:
             st.stop()  # waiting for a recording + transcript
+    elif source == SOURCE_VIDEO:
+        rec = _capture_video_call()
+        if rec is None:
+            st.stop()  # waiting for the play + transcribe click
     else:
         if st.session_state.selected is None:
-            st.info("👈 Pick a call from the sidebar — or switch Call source to 🎙️ Live mic.")
+            st.info("👈 Pick a call from the sidebar — or switch Call source to 🎙️ Live mic / 🎬 Demo video.")
             st.stop()
         rec = agent.CALLS[st.session_state.selected]
     _render_detect_call(rec)
+
+    # HERO reveal. Canned calls wait for a "▶ Play call" click (a scripted, on-cue demo
+    # moment). The live-mic and demo-video paths AUTO-RUN once their audio is in hand
+    # (recording stopped / video transcribed) — the honest "the call ends, the copilot
+    # already has the answer" moment. All paths share the replay + one-real-decision below.
+    if not st.session_state.call_played:
+        if not auto_run:
+            st.caption("▶ Press play — the copilot analyzes the call as the caller speaks.")
+            if not st.button("▶ Play call", type="primary", use_container_width=True):
+                st.stop()  # canned: wait for the on-cue click
+        _play_call(rec)                   # progressive transcript + signal dashboard
+        _run_decision(rec, is_call=True)  # the ONE real Gemini call (free-tier model)
+        st.session_state.call_played = True
+        st.session_state.log_done = False            # decision log reveals post-rerun
+        st.session_state.deliver_status = "pending"  # awaiting the agent's verify
+        st.rerun()
+    # Settled: full dashboard (shows the DECIDED severity + real time-to-triage).
     _render_signal_dashboard(rec)
+    # Cross-incident intelligence — the systemic pattern recognized BEFORE the decision
+    # log, so the narrative reads: signals -> pattern -> agent decides -> dispatch.
+    _render_incident_intelligence(rec, st.session_state.cluster)
+    # Queue intelligence — proactive action on the OTHER callers from this main still
+    # holding in the queue. Only surfaces during a systemic cluster.
+    _render_queue_intelligence(st.session_state.cluster)
 else:
     if st.session_state.selected is None:
         st.info("👈 Pick a customer from the sidebar to detect their bill shock.")
@@ -727,27 +1110,12 @@ else:
     rec = agent.CUSTOMERS[st.session_state.selected]
     _render_detect(rec)
 
-run = st.button("⚡ Run Agent", type="primary", use_container_width=True)
-
-# Trigger the DECIDE call on click; persist the result across reruns.
-if run:
-    with st.spinner(f"Reasoning… (real Gemini call · {agent.PRIMARY_MODEL})"):
-        _t0 = time.time()
-        if is_call:
-            st.session_state.decision = agent.decide(
-                st.session_state.client, rec,
-                build_prompt_fn=agent.build_call_prompt,
-                deterministic_fn=agent._deterministic_call_decision,
-                valid_routes=agent.CALL_ROUTES,
-            )
-        else:
-            st.session_state.decision = agent.decide(st.session_state.client, rec)
-        st.session_state.decision_latency = round(time.time() - _t0, 2)
-    st.session_state.log_done = False            # replay the reveal for this fresh decision
-    st.session_state.deliver_status = "pending"  # new decision → awaiting the human decision
-    # Rerun so the dashboard (rendered above the button) picks up the fresh latency this
-    # cycle instead of one interaction late; the staged reveal still plays post-rerun.
-    st.rerun()
+    # Bill Shock (scalability retarget) keeps the one-click Run Agent trigger.
+    if st.button("⚡ Run Agent", type="primary", use_container_width=True):
+        _run_decision(rec, is_call=False)
+        st.session_state.log_done = False            # replay the reveal for this fresh decision
+        st.session_state.deliver_status = "pending"  # new decision → awaiting the human decision
+        st.rerun()
 
 decision = st.session_state.decision
 if decision:
@@ -785,7 +1153,13 @@ if show_profile:
 
 if show_prompt:
     if is_call:
-        _sys_i, _user_c = agent.build_call_prompt(rec)
+        # Show the ACTUAL prompt sent — including injected cross-incident context when a
+        # cluster fired and injection is on, so judges see the intelligence reach the model.
+        _clu = st.session_state.cluster
+        if CLUSTER_PROMPT_INJECTION and _clu and _clu.get("clustered"):
+            _sys_i, _user_c = agent.build_call_prompt(rec, cluster=_clu)
+        else:
+            _sys_i, _user_c = agent.build_call_prompt(rec)
     else:
         _sys_i, _user_c = agent.build_prompt(rec)
     st.markdown("**📨 Prompt sent to Gemini — the slim payload the model actually saw**")
