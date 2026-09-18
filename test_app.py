@@ -275,6 +275,53 @@ def test_cluster_isolated_panel_renders_for_trevor():
     assert "SYSTEMIC" not in md, "false systemic cluster shown for Trevor"
 
 
+# ---- queue intelligence (proactive action on waiting callers) --------------
+def test_triage_queue_flags_same_main_for_rosa():
+    """Rosa's cluster sweeps in the Maple St queue callers, vulnerable-first, and
+    leaves off-main callers alone."""
+    cluster = agent.detect_cluster(agent.CALLS[0])
+    qr = agent.triage_queue(agent.QUEUE, cluster)
+    assert qr["active"] and qr["reached"] >= 2
+    # every swept caller is actually on the affected main
+    for q in qr["same_main"]:
+        assert agent.normalize_street(q["address"]) == cluster["street_key"]
+    # off-main callers (Oakdale, Birchwood) are excluded
+    swept_ids = {q["id"] for q in qr["same_main"]}
+    assert "Q-5" not in swept_ids and "Q-6" not in swept_ids, "off-main caller swept in"
+    # vulnerable ordered first
+    assert agent._queue_is_vulnerable(qr["same_main"][0]), "queue not vulnerable-first"
+    assert qr["prioritized_count"] >= 1
+    assert qr["agent_minutes_freed"] >= 0
+
+
+def test_triage_queue_noop_without_cluster():
+    """No cluster → no proactive queue action (Trevor's isolated call)."""
+    cluster = agent.detect_cluster(agent.CALLS[1])
+    qr = agent.triage_queue(agent.QUEUE, cluster)
+    assert qr["active"] is False
+    assert qr["same_main"] == [] and qr["reached"] == 0
+
+
+def test_queue_broadcast_flow_offline():
+    """The queue panel renders during Rosa's cluster and the broadcast action completes.
+    Offline-safe (deterministic fallback still fires the cluster)."""
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.secrets["GEMINI_API_KEY"] = agent._load_api_key() or "ci-dummy-key"
+    at.run()
+    assert not at.exception, f"app raised on startup: {at.exception}"
+    _click(at, "Rosa")
+    at.run()
+    _click(at, "Play call")
+    at.run()
+    assert not at.exception, f"queue render raised: {at.exception}"
+    assert "Queue intelligence" in _md(at), "queue panel missing during cluster"
+    assert at.session_state["queue_broadcast"] == "pending"
+    at.button(key="queue_broadcast_btn").click()
+    at.run()
+    assert at.session_state["queue_broadcast"] == "sent"
+    assert "Area safety alert sent" in _md(at), "broadcast confirmation missing"
+
+
 # ---- plain-python runner (no pytest needed) --------------------------------
 if __name__ == "__main__":
     import sys
@@ -285,6 +332,8 @@ if __name__ == "__main__":
         test_cluster_fires_for_rosa, test_cluster_does_not_fire_for_trevor,
         test_cluster_does_not_fire_for_marcus, test_cluster_prompt_injection_safe,
         test_cluster_panel_renders_offline, test_cluster_isolated_panel_renders_for_trevor,
+        test_triage_queue_flags_same_main_for_rosa, test_triage_queue_noop_without_cluster,
+        test_queue_broadcast_flow_offline,
         test_live_decision,
     ]
     passed = failures = skipped = 0

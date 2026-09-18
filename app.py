@@ -219,6 +219,7 @@ for _key, _default in [
     ("live_transcript", ""),        # Gemini transcription of the recorded call
     ("live_audio_sig", None),       # hash of the last transcribed audio (avoid re-calling)
     ("cluster", None),              # cross-incident cluster dict for the active call, or None
+    ("queue_broadcast", "pending"), # proactive queue action state: pending | sent
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -231,6 +232,7 @@ def _clear_decision() -> None:
     st.session_state.log_done = False
     st.session_state.deliver_status = "pending"
     st.session_state.cluster = None
+    st.session_state.queue_broadcast = "pending"
 
 
 def _select_customer(idx: int) -> None:
@@ -576,6 +578,85 @@ background:#052E2B;border:1px solid #0D9488;border-left:4px solid #22D3EE;">
         "transcript reveals this. The dollar figure prices only avoidable dispatches; the "
         "safety benefit is shown as exposure-minutes and the flagged household — deliberately not dollarized."
     )
+
+
+def _render_queue_intelligence(cluster: "Dict[str, Any] | None") -> None:
+    """Proactive action on callers STILL HOLDING in the queue during a systemic event.
+
+    Only appears when a cluster fired: finds the queued callers on the same main, orders
+    them vulnerable-first, and offers ONE broadcast safety alert that reaches them all in
+    seconds and collapses that main's queue to a single coordinated response. Deterministic
+    (reads triage_queue()), human-in-the-loop (a supervisor confirms the broadcast).
+    """
+    if not cluster or not cluster.get("clustered"):
+        return
+    qr = agent.triage_queue(agent.QUEUE, cluster)
+    if not qr.get("active") or not qr.get("same_main"):
+        return
+
+    st.markdown("### 📞 Queue intelligence — proactive")
+    st.caption(
+        f"While the agent handles this call, {qr['reached']} others from "
+        f"{qr['street_label']} are holding in the queue — same main, same event."
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Waiting on this main", qr["reached"])
+    m2.metric("Longest wait", f"{qr['longest_wait_min']} min")
+    m3.metric("Vulnerable in queue", qr["prioritized_count"])
+    m4.metric("Agent-minutes freed", qr["agent_minutes_freed"])
+
+    rows = []
+    for rank, q in enumerate(qr["same_main"], start=1):
+        vflag = q.get("vulnerability_flag")
+        chip = (
+            f' <span style="background:#CA8A04;color:#fff;padding:1px 7px;border-radius:10px;'
+            f'font-size:0.72rem;font-weight:700;">{html.escape(vflag)}</span>' if vflag else ""
+        )
+        border = "#CA8A04" if agent._queue_is_vulnerable(q) else "#334155"
+        rows.append(
+            f"""<div style="padding:0.4rem 0.7rem;border-left:3px solid {border};margin:0.25rem 0;
+background:rgba(255,255,255,0.04);border-radius:0.35rem;">
+  <b>#{rank}</b> · {html.escape(q.get('caller_name',''))} · {html.escape(q.get('address',''))}
+  · waiting {q.get('waiting_min','?')} min{chip}
+  <div style="font-size:0.82rem;color:#94A3B8;margin-top:0.1rem;">“{html.escape(q.get('reason',''))}”</div>
+</div>"""
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True)
+
+    if st.session_state.queue_broadcast == "pending":
+        st.markdown(
+            f"""<div style="padding:0.85rem 1.1rem;border-radius:0.6rem;background:#111C31;
+border:2px dashed #22D3EE;color:#E2E8F0;margin-top:0.3rem;">
+  <div style="font-weight:800;color:#38BDF8;">📣 Prepared: one action for the whole main</div>
+  <div style="margin-top:0.25rem;font-size:0.9rem;color:#94A3B8;">
+    Broadcast an area safety alert to all {qr['reached']} waiting callers on {html.escape(qr['street_label'])}
+    (“Gas detected in your area — evacuate now, crew en route”) and bump the
+    {qr['prioritized_count']} vulnerable callers to a live agent.
+  </div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        if st.button("📣 Broadcast area safety alert + prioritize vulnerable",
+                     type="primary", use_container_width=True, key="queue_broadcast_btn"):
+            st.session_state.queue_broadcast = "sent"
+            st.rerun()
+        st.caption("Nothing goes out until a supervisor confirms — the human stays in the loop.")
+    else:
+        st.markdown(
+            f"""<div style="padding:0.9rem 1.1rem;border-radius:0.6rem;background:#052E2B;
+border:2px solid #0D9488;color:#E2E8F0;margin-top:0.3rem;">
+  <div style="font-weight:800;color:#5EEAD4;">✅ Area safety alert sent to {qr['reached']} callers</div>
+  <div style="margin-top:0.3rem;">Queue for {html.escape(qr['street_label'])} collapsed
+    <b>{qr['reached']} &rarr; 1</b> coordinated response ·
+    <b>{qr['prioritized_count']}</b> vulnerable prioritized for a live agent ·
+    <b>{qr['deflected']}</b> info-only callers answered without waiting.</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "DELIVER is mocked — in production this fires the SMS/IVR broadcast and re-orders the "
+            "live queue. Vulnerable callers are prioritized, never deflected."
+        )
 
 
 def _capture_live_call() -> "Dict[str, Any] | None":
@@ -941,6 +1022,9 @@ if is_call:
     # Cross-incident intelligence — the systemic pattern recognized BEFORE the decision
     # log, so the narrative reads: signals -> pattern -> agent decides -> dispatch.
     _render_incident_intelligence(rec, st.session_state.cluster)
+    # Queue intelligence — proactive action on the OTHER callers from this main still
+    # holding in the queue. Only surfaces during a systemic cluster.
+    _render_queue_intelligence(st.session_state.cluster)
 else:
     if st.session_state.selected is None:
         st.info("👈 Pick a customer from the sidebar to detect their bill shock.")

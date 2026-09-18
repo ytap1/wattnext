@@ -671,6 +671,84 @@ def detect_cluster(call: dict, incidents=INCIDENTS,
     }
 
 
+# ==================================================================
+# QUEUE INTELLIGENCE — proactive action on callers still waiting.
+# When a systemic cluster fires, the queue fills with callers from the SAME main
+# who are waiting one-by-one while the hazard is live. triage_queue() finds them,
+# orders them vulnerable-first, and prepares ONE broadcast safety alert so N waiting
+# callers are reached in seconds and the queue for that main collapses to a single
+# coordinated response. Pure/deterministic (no model call); reuses normalize_street.
+# ==================================================================
+
+QUEUE_AVG_HANDLE_MIN = 6   # ASSUMPTION: avg agent handle time for one emergency-info call
+
+# Callers currently holding in the contact-centre queue — mock data, inline like
+# CALLS/INCIDENTS. During Rosa's Maple St cluster, the Maple callers here are the ones
+# WattNext can act on proactively; the off-main callers prove it targets only the event.
+QUEUE = [
+    {"id": "Q-1", "caller_name": "Maria Alvarez", "address": "455 Maple Street",
+     "waiting_min": 4, "medical_dependent": True, "vulnerability_flag": "mobility-impaired",
+     "reason": "smells gas, can't get downstairs quickly"},
+    {"id": "Q-2", "caller_name": "Dan Whitfield", "address": "410 Maple Street, Apt 1A",
+     "waiting_min": 7, "medical_dependent": False, "vulnerability_flag": None,
+     "reason": "wants to know what's happening on the street"},
+    {"id": "Q-3", "caller_name": "Priya Nair", "address": "421 Maple Street",
+     "waiting_min": 2, "medical_dependent": False, "vulnerability_flag": "infant at home",
+     "reason": "gas smell in the hallway"},
+    {"id": "Q-4", "caller_name": "Greg Han", "address": "437 Maple Street",
+     "waiting_min": 5, "medical_dependent": False, "vulnerability_flag": None,
+     "reason": "is it safe to stay inside?"},
+    # Off-main callers — must NOT be swept into the Maple St action.
+    {"id": "Q-5", "caller_name": "Tom Becker", "address": "8 Oakdale Road",
+     "waiting_min": 9, "medical_dependent": False, "vulnerability_flag": None,
+     "reason": "billing question"},
+    {"id": "Q-6", "caller_name": "Susan Lee", "address": "63 Birchwood Lane",
+     "waiting_min": 3, "medical_dependent": False, "vulnerability_flag": None,
+     "reason": "faint odor, non-urgent"},
+]
+
+
+def _queue_is_vulnerable(rec: dict) -> bool:
+    return bool(rec.get("medical_dependent")) or bool(rec.get("vulnerability_flag"))
+
+
+def triage_queue(queue=QUEUE, cluster: "dict | None" = None) -> dict:
+    """Given the waiting queue and a detected cluster, find callers on the SAME main and
+    prepare the proactive action. Returns an empty/no-op result unless a cluster fired.
+
+    Ordering: vulnerable first, then longest-waiting. Deterministic — no model call.
+    'reached' = everyone on the affected main gets the broadcast; 'prioritized' = the
+    vulnerable ones also bumped for a live agent; 'deflected' = info-only callers the
+    broadcast answers without an agent (conservatively, the non-vulnerable same-main ones).
+    """
+    empty = {
+        "active": False, "street_label": "", "same_main": [], "others": list(queue),
+        "reached": 0, "prioritized_count": 0, "deflected": 0, "longest_wait_min": 0,
+        "agent_minutes_freed": 0, "vulnerable": [],
+    }
+    if not cluster or not cluster.get("clustered"):
+        return empty
+    key = cluster.get("street_key") or ""
+    same_main = [q for q in queue if normalize_street(q.get("address", "")) == key and key]
+    if not same_main:
+        return empty
+    same_main.sort(key=lambda q: (not _queue_is_vulnerable(q), -q.get("waiting_min", 0)))
+    vulnerable = [q for q in same_main if _queue_is_vulnerable(q)]
+    deflected = len(same_main) - len(vulnerable)
+    return {
+        "active": True,
+        "street_label": cluster.get("street_label", "this main"),
+        "same_main": same_main,
+        "others": [q for q in queue if q not in same_main],
+        "reached": len(same_main),
+        "prioritized_count": len(vulnerable),
+        "deflected": deflected,
+        "longest_wait_min": max((q.get("waiting_min", 0) for q in same_main), default=0),
+        "agent_minutes_freed": deflected * QUEUE_AVG_HANDLE_MIN,
+        "vulnerable": vulnerable,
+    }
+
+
 # ------------------------------------------------------------------
 # Headless smoke test — the checkpoint artifact.
 #   GEMINI_API_KEY=... python agent.py
@@ -772,3 +850,15 @@ if __name__ == "__main__":
             f"(prior={c['prior_count']}, total={c['total_reports']}, "
             f"vuln={len(c['vulnerable_neighbors'])})"
         )
+
+    # Queue intelligence smoke — for Rosa's Maple St cluster, expect the Maple callers
+    # swept in and the off-main callers left alone.
+    print("\n=== Queue Intelligence (Rosa's cluster) ===")
+    qr = triage_queue(QUEUE, detect_cluster(CALLS[0]))
+    print(
+        f"active={qr['active']} reached={qr['reached']} prioritized={qr['prioritized_count']} "
+        f"deflected={qr['deflected']} agent_min_freed={qr['agent_minutes_freed']}"
+    )
+    for q in qr["same_main"]:
+        tag = "VULN" if _queue_is_vulnerable(q) else "info"
+        print(f"    [{tag}] {q['caller_name']:<14} {q['address']:<24} waited {q['waiting_min']}m")
